@@ -1,0 +1,9 @@
+.env
+models/*.gguf
+models/*.tmp
+data/
+bot/bot
+data-api/data-api
+config/user-names.json
+.claude/
+searxng/settings.yml

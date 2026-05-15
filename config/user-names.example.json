@@ -1,0 +1,6 @@
+{
+  "_comment": "Optional: override what the bot calls people. Copy to user-names.json and fill in. Keys are Telegram user IDs (as strings). Values are the friendly name the LLM will use in [Name] prefixes. Hot-reloaded on each message.",
+  "111111111": "Pibe",
+  "222222222": "Capo",
+  "333333333": "Loco"
+}

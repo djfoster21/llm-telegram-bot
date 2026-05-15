@@ -1,0 +1,94 @@
+services:
+  model-init:
+    image: alpine:3.20
+    volumes:
+      - ./models:/models
+    environment:
+      MODEL_URL: ${MODEL_URL}
+      MODEL_FILE: ${MODEL_FILE}
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ -z "$$MODEL_URL" ] || [ -z "$$MODEL_FILE" ]; then
+          echo "MODEL_URL and MODEL_FILE must be set in .env" >&2
+          exit 1
+        fi
+        if [ -f "/models/$$MODEL_FILE" ]; then
+          echo "Model already present: $$MODEL_FILE"
+          exit 0
+        fi
+        echo "Downloading $$MODEL_FILE from $$MODEL_URL ..."
+        apk add --no-cache --quiet curl
+        curl -L --fail --progress-bar -o "/models/$$MODEL_FILE.tmp" "$$MODEL_URL"
+        mv "/models/$$MODEL_FILE.tmp" "/models/$$MODEL_FILE"
+        echo "Done."
+
+  llama-server:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./models:/models:ro
+    command:
+      - -m
+      - /models/${MODEL_FILE}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -c
+      - "${LLAMA_CTX:-4096}"
+      - -t
+      - "${LLAMA_THREADS:-4}"
+      - --n-gpu-layers
+      - "${LLAMA_NGL:-24}"
+      - --parallel
+      - "1"
+      - --jinja
+      - -fa
+      - "on"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      BASE_URL: http://searxng:8080/
+      INSTANCE_NAME: local-bot-search
+    restart: unless-stopped
+
+  data-api:
+    build: ./data-api
+    restart: unless-stopped
+
+  bot:
+    build: ./bot
+    depends_on:
+      llama-server:
+        condition: service_started
+      searxng:
+        condition: service_started
+      data-api:
+        condition: service_started
+    volumes:
+      - ./data:/data
+      - ./config:/config:ro
+    env_file: .env
+    environment:
+      LLAMA_BASE_URL: http://llama-server:8080
+      SEARXNG_URL: http://searxng:8080
+      DATA_API_URL: http://data-api:8080
+      DB_PATH: /data/bot.db
+      SYSTEM_PROMPT_PATH: /config/system-prompt.txt
+    restart: unless-stopped
