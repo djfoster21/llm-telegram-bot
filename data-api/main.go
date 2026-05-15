@@ -15,42 +15,52 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	geocodeAPI    = "https://geocoding-api.open-meteo.com/v1/search"
-	forecastAPI   = "https://api.open-meteo.com/v1/forecast"
-	coingeckoAPI  = "https://api.coingecko.com/api/v3/simple/price"
-	dolarAPIBase  = "https://dolarapi.com/v1/dolares"
-	erAPIBase     = "https://open.er-api.com/v6/latest"
+	geocodeAPI     = "https://geocoding-api.open-meteo.com/v1/search"
+	forecastAPI    = "https://api.open-meteo.com/v1/forecast"
+	coingeckoAPI   = "https://api.coingecko.com/api/v3/simple/price"
+	dolarAPIBase   = "https://dolarapi.com/v1/dolares"
+	erAPIBase      = "https://open.er-api.com/v6/latest"
 	requestTimeout = 10 * time.Second
 )
 
 var client = &http.Client{Timeout: requestTimeout}
 
-// coinIDs maps user-friendly crypto symbols to CoinGecko's coin IDs. Add to
-// this list as needed — anything not here returns a helpful error.
+// Add new tickers here; unknown symbols return a helpful error to the caller.
 var coinIDs = map[string]string{
-	"BTC":  "bitcoin",
-	"ETH":  "ethereum",
-	"USDT": "tether",
-	"USDC": "usd-coin",
-	"SOL":  "solana",
-	"XRP":  "ripple",
-	"ADA":  "cardano",
-	"DOGE": "dogecoin",
-	"DOT":  "polkadot",
-	"AVAX": "avalanche-2",
-	"LINK": "chainlink",
+	"BTC":   "bitcoin",
+	"ETH":   "ethereum",
+	"USDT":  "tether",
+	"USDC":  "usd-coin",
+	"SOL":   "solana",
+	"XRP":   "ripple",
+	"ADA":   "cardano",
+	"DOGE":  "dogecoin",
+	"DOT":   "polkadot",
+	"AVAX":  "avalanche-2",
+	"LINK":  "chainlink",
 	"MATIC": "matic-network",
-	"BNB":  "binancecoin",
-	"LTC":  "litecoin",
-	"TRX":  "tron",
+	"BNB":   "binancecoin",
+	"LTC":   "litecoin",
+	"TRX":   "tron",
 }
 
-// dolarTypes lists the ARS exchange-rate variants DolarAPI returns.
-var dolarTypes = []string{"oficial", "blue", "bolsa", "contadoconliqui", "tarjeta", "mayorista", "cripto"}
+// dolarTypes maps the DolarAPI path slug to the response-key name we expose
+// to the LLM. Aliases (bolsa→mep, contadoconliqui→ccl) match the wording the
+// tool description advertises so the model sees the keys it expects.
+var dolarTypes = []struct{ path, key string }{
+	{"oficial", "oficial"},
+	{"blue", "blue"},
+	{"bolsa", "mep"},
+	{"contadoconliqui", "ccl"},
+	{"tarjeta", "tarjeta"},
+	{"mayorista", "mayorista"},
+	{"cripto", "cripto"},
+}
 
 func main() {
 	mux := http.NewServeMux()
@@ -73,23 +83,23 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // ---------------- weather ----------------
 
 type weatherResp struct {
-	Location  string       `json:"location"`
-	Country   string       `json:"country,omitempty"`
-	Current   currentDay   `json:"current"`
-	Today     dailyForecast `json:"today"`
-	Tomorrow  dailyForecast `json:"tomorrow,omitempty"`
+	Location string        `json:"location"`
+	Country  string        `json:"country,omitempty"`
+	Current  currentDay    `json:"current"`
+	Today    dailyForecast `json:"today"`
+	Tomorrow dailyForecast `json:"tomorrow,omitempty"`
 }
 
 type currentDay struct {
-	TempC      float64 `json:"temp_c"`
-	WindKmh    float64 `json:"wind_kmh"`
-	Condition  string  `json:"condition"`
+	TempC     float64 `json:"temp_c"`
+	WindKmh   float64 `json:"wind_kmh"`
+	Condition string  `json:"condition"`
 }
 
 type dailyForecast struct {
 	MinC      float64 `json:"min_c"`
 	MaxC      float64 `json:"max_c"`
-	RainMm    float64 `json:"precip_mm"`
+	PrecipMm  float64 `json:"precip_mm"`
 	Condition string  `json:"condition"`
 }
 
@@ -163,7 +173,7 @@ func handleWeather(w http.ResponseWriter, r *http.Request) {
 		resp.Today = dailyForecast{
 			MinC:      fcst.Daily.TempMin[0],
 			MaxC:      fcst.Daily.TempMax[0],
-			RainMm:    fcst.Daily.PrecipitationSum[0],
+			PrecipMm:  fcst.Daily.PrecipitationSum[0],
 			Condition: wmoToString(fcst.Daily.WeatherCode[0]),
 		}
 	}
@@ -171,7 +181,7 @@ func handleWeather(w http.ResponseWriter, r *http.Request) {
 		resp.Tomorrow = dailyForecast{
 			MinC:      fcst.Daily.TempMin[1],
 			MaxC:      fcst.Daily.TempMax[1],
-			RainMm:    fcst.Daily.PrecipitationSum[1],
+			PrecipMm:  fcst.Daily.PrecipitationSum[1],
 			Condition: wmoToString(fcst.Daily.WeatherCode[1]),
 		}
 	}
@@ -208,10 +218,10 @@ func wmoToString(code int) string {
 // ---------------- crypto ----------------
 
 type cryptoResp struct {
-	Symbol   string  `json:"symbol"`
-	Name     string  `json:"name"`
-	PriceUSD float64 `json:"price_usd"`
-	PriceARS float64 `json:"price_ars,omitempty"`
+	Symbol       string  `json:"symbol"`
+	Name         string  `json:"name"`
+	PriceUSD     float64 `json:"price_usd"`
+	PriceARS     float64 `json:"price_ars,omitempty"`
 	Change24hPct float64 `json:"change_24h_pct"`
 }
 
@@ -274,21 +284,33 @@ func handleFx(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Special case: USD→ARS returns ALL the ARS variants (blue, oficial, etc.)
-	// since Argentinians always want to know which rate.
+	// since Argentinians always want to know which rate. Fan out so total
+	// latency is one upstream RTT instead of ~7.
 	if from == "USD" && to == "ARS" {
-		rates := map[string]float64{}
+		var (
+			wg    sync.WaitGroup
+			mu    sync.Mutex
+			rates = map[string]float64{}
+		)
 		for _, t := range dolarTypes {
-			var d struct {
-				Compra float64 `json:"compra"`
-				Venta  float64 `json:"venta"`
-			}
-			if err := fetchJSON(r.Context(), dolarAPIBase+"/"+t, &d); err != nil {
-				continue
-			}
-			if d.Venta > 0 {
-				rates[t] = d.Venta
-			}
+			wg.Add(1)
+			go func(path, key string) {
+				defer wg.Done()
+				var d struct {
+					Compra float64 `json:"compra"`
+					Venta  float64 `json:"venta"`
+				}
+				if err := fetchJSON(r.Context(), dolarAPIBase+"/"+path, &d); err != nil {
+					return
+				}
+				if d.Venta > 0 {
+					mu.Lock()
+					rates[key] = d.Venta
+					mu.Unlock()
+				}
+			}(t.path, t.key)
 		}
+		wg.Wait()
 		if len(rates) == 0 {
 			writeError(w, http.StatusBadGateway, "dolarapi returned no rates")
 			return

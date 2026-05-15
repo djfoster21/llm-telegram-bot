@@ -68,3 +68,17 @@ func (s *Store) Clear(chatID int64) error {
 	_, err := s.db.Exec(`DELETE FROM history WHERE chat_id = ?`, chatID)
 	return err
 }
+
+// Count returns the number of messages stored for chatID without unmarshalling
+// the full blob. Returns 0 with nil error when the row does not exist.
+func (s *Store) Count(chatID int64) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT json_array_length(messages) FROM history WHERE chat_id = ?`,
+		chatID,
+	).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return n, err
+}

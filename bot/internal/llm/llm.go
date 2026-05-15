@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"llm-telegram-bot/internal/textutil"
 )
 
 type Message struct {
@@ -148,7 +150,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
-		return "", nil, fmt.Errorf("llama-server %d: %s", resp.StatusCode, truncate(string(b), 400))
+		return "", nil, fmt.Errorf("llama-server %d: %s", resp.StatusCode, textutil.Ellipsize(string(b), 400))
 	}
 
 	var content strings.Builder
@@ -216,11 +218,4 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 		ordered = append(ordered, *calls[i])
 	}
 	return content.String(), ordered, nil
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }

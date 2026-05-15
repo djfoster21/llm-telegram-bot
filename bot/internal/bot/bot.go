@@ -19,6 +19,7 @@ import (
 	"llm-telegram-bot/internal/config"
 	"llm-telegram-bot/internal/llm"
 	"llm-telegram-bot/internal/store"
+	"llm-telegram-bot/internal/textutil"
 	"llm-telegram-bot/internal/tools"
 )
 
@@ -26,33 +27,24 @@ const (
 	maxToolRounds     = 4
 	streamInterval    = 1100 * time.Millisecond
 	maxMsgLen         = 4000
-	maxStoredMessages = 300 // absolute cap on per-chat rows to bound disk growth
+	maxStoredMessages = 300
 
-	// Spontaneous-take frequency window: every N user messages (in a group),
-	// chosen uniformly from [min, max], the bot may chime in unprompted.
 	spontaneousMin = 1
 	spontaneousMax = 15
 
-	// Auto-summarization: when stored messages exceed this count, compress the
-	// oldest portion into a single "[CONTEXTO ANTERIOR]" user message so the
-	// bot keeps long-term context without blowing the token budget.
 	autoSummaryAtMessages = 60
 	autoSummaryKeepRecent = 30
 	autoSummaryMarker     = "[CONTEXTO ANTERIOR]"
 	autoSummaryCooldown   = 30 * time.Minute
 
-	// Probability of reacting to a message that matches a pattern. Keeps the
-	// bot from spamming a 🤣 on every "jaja" while still feeling alive.
 	reactionProbability = 0.4
 
-	// Generic message shown to chat on internal errors. The full error is
-	// logged; we don't leak it to users because it can carry internal
-	// hostnames or paths.
+	// User-facing error string. Internal errors are logged but never surfaced
+	// because they can leak hostnames, paths, or upstream tokens.
 	genericErrorMsg = "Uy, se me colgó algo. Probá de nuevo."
 )
 
-// reactionPatterns maps regex matches on message text to one of Telegram's
-// allowed reaction emojis. Order matters — first match wins.
+// Order matters — first match wins.
 var reactionPatterns = []struct {
 	re    *regexp.Regexp
 	emoji string
@@ -74,25 +66,30 @@ type Bot struct {
 	tools    *tools.Registry
 	username string
 
+	// rootCtx is set by Run; spawned goroutines use it so SIGTERM propagates.
+	rootCtx context.Context
+
 	inflightMu sync.Mutex
 	inflight   map[int64]bool
 
-	// per-chat write mutex so concurrent archive + respond don't race on the
-	// load → modify → save pattern.
+	// Serializes load→modify→save on the per-chat history blob.
 	chatLocks sync.Map // map[int64]*sync.Mutex
 
-	// per-chat spontaneous-reply state.
 	spontMu   sync.Mutex
 	spontData map[int64]*spontaneousState
 
-	// per-chat auto-summarization state — prevents two background summarizers
-	// from running on the same chat concurrently, enforces a cooldown so it
-	// can't immediately re-fire, and tracks a cancel func so addressed user
-	// messages can interrupt a running summary.
-	summarizingMu     sync.Mutex
-	summarizing       map[int64]bool
-	lastSummaryAt     map[int64]time.Time
-	summaryCancel     map[int64]context.CancelFunc
+	summarizingMu sync.Mutex
+	summarizing   map[int64]bool
+	lastSummaryAt map[int64]time.Time
+	summaryCancel map[int64]context.CancelFunc
+
+	// mtime-keyed caches for files re-read on every turn / every message.
+	promptMu     sync.RWMutex
+	promptMtime  time.Time
+	promptCached string
+	namesMu      sync.RWMutex
+	namesMtime   time.Time
+	namesCached  map[string]string
 }
 
 type spontaneousState struct {
@@ -110,12 +107,12 @@ func New(cfg *config.Config, db *store.Store, llmClient *llm.Client, registry *t
 		return nil, fmt.Errorf("get me: %w", err)
 	}
 	return &Bot{
-		cfg:       cfg,
-		tg:        tg,
-		store:     db,
-		llm:       llmClient,
-		tools:     registry,
-		username:  me.Username,
+		cfg:           cfg,
+		tg:            tg,
+		store:         db,
+		llm:           llmClient,
+		tools:         registry,
+		username:      me.Username,
 		inflight:      map[int64]bool{},
 		spontData:     map[int64]*spontaneousState{},
 		summarizing:   map[int64]bool{},
@@ -124,8 +121,6 @@ func New(cfg *config.Config, db *store.Store, llmClient *llm.Client, registry *t
 	}, nil
 }
 
-// claimInflight returns true if we acquired the per-chat inference lock,
-// false if there's already an inference in flight for this chat.
 func (b *Bot) claimInflight(chatID int64) bool {
 	b.inflightMu.Lock()
 	defer b.inflightMu.Unlock()
@@ -142,40 +137,12 @@ func (b *Bot) releaseInflight(chatID int64) {
 	delete(b.inflight, chatID)
 }
 
-// chatLock returns the per-chat write mutex for serializing history updates.
 func (b *Bot) chatLock(chatID int64) *sync.Mutex {
 	actual, _ := b.chatLocks.LoadOrStore(chatID, &sync.Mutex{})
 	return actual.(*sync.Mutex)
 }
 
-// archiveMessage appends a user message to the chat's history. Used for both
-// @mentions and non-mention group chatter so the LLM sees the full conversation.
-func (b *Bot) archiveMessage(chatID int64, user *telego.User, text string) {
-	lock := b.chatLock(chatID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	msgs, err := b.store.Load(chatID)
-	if err != nil {
-		log.Printf("archive load: %v", err)
-		return
-	}
-	msgs = append(msgs, store.Message{
-		Role:    "user",
-		Content: fmt.Sprintf("[%s] %s", b.speakerName(user), text),
-	})
-	if len(msgs) > maxStoredMessages {
-		msgs = msgs[len(msgs)-maxStoredMessages:]
-	}
-	if err := b.store.Save(chatID, msgs); err != nil {
-		log.Printf("archive save: %v", err)
-	}
-}
-
-// appendAssistant adds the model's reply to the chat's history. Run after
-// inference completes; reloads the current history to capture any messages
-// archived concurrently during inference.
-func (b *Bot) appendAssistant(chatID int64, text string) {
+func (b *Bot) appendMessage(chatID int64, m store.Message) {
 	lock := b.chatLock(chatID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -185,7 +152,7 @@ func (b *Bot) appendAssistant(chatID int64, text string) {
 		log.Printf("append load: %v", err)
 		return
 	}
-	msgs = append(msgs, store.Message{Role: "assistant", Content: text})
+	msgs = append(msgs, m)
 	if len(msgs) > maxStoredMessages {
 		msgs = msgs[len(msgs)-maxStoredMessages:]
 	}
@@ -194,9 +161,6 @@ func (b *Bot) appendAssistant(chatID int64, text string) {
 	}
 }
 
-// tickSpontaneous increments the per-chat user-message counter and returns
-// true if it crossed the random threshold (meaning: time for an unprompted
-// take). Resets and picks a new threshold after firing.
 func (b *Bot) tickSpontaneous(chatID int64) bool {
 	b.spontMu.Lock()
 	defer b.spontMu.Unlock()
@@ -219,16 +183,21 @@ func randomThreshold() int {
 	return spontaneousMin + rand.Intn(spontaneousMax-spontaneousMin+1)
 }
 
-// spontaneousReply fires an unprompted take based on the current chat history.
-// Bails out silently if another inference is already running or if the model
-// returns nothing useful.
+func buildLLMMessages(systemPrompt string, history []store.Message) []llm.Message {
+	out := make([]llm.Message, 0, len(history)+1)
+	out = append(out, llm.Message{Role: "system", Content: systemPrompt})
+	for _, m := range history {
+		out = append(out, llm.Message{Role: m.Role, Content: m.Content})
+	}
+	return out
+}
+
 func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
 	if !b.claimInflight(chatID) {
 		return
 	}
 	defer b.releaseInflight(chatID)
 
-	systemPrompt := b.loadSystemPrompt()
 	history, err := b.store.Load(chatID)
 	if err != nil {
 		return
@@ -238,10 +207,7 @@ func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
 		return
 	}
 
-	llmMsgs := []llm.Message{{Role: "system", Content: systemPrompt}}
-	for _, m := range history {
-		llmMsgs = append(llmMsgs, llm.Message{Role: m.Role, Content: m.Content})
-	}
+	llmMsgs := buildLLMMessages(b.loadSystemPrompt(), history)
 	llmMsgs = append(llmMsgs, llm.Message{
 		Role: "user",
 		Content: "[SISTEMA] Sumate a la conversación como un amigo más, sin que nadie te invite. " +
@@ -263,19 +229,15 @@ func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
 		log.Printf("spontaneous: chat=%d model chose to skip", chatID)
 		return
 	}
-	if len(final) > maxMsgLen {
-		final = final[:maxMsgLen] + "..."
-	}
+	final = textutil.Ellipsize(final, maxMsgLen)
 	if _, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), final)); err != nil {
 		log.Printf("spontaneous send: %v", err)
 		return
 	}
-	log.Printf("spontaneous reply: chat=%d text=%q", chatID, truncate(final, 200))
-	b.appendAssistant(chatID, final)
+	log.Printf("spontaneous reply: chat=%d text=%q", chatID, textutil.Ellipsize(final, 200))
+	b.appendMessage(chatID, store.Message{Role: "assistant", Content: final})
 }
 
-// tryReact emits a Telegram message reaction if msg.Text matches one of the
-// reaction patterns and a random gate fires. Best-effort, async-safe.
 func (b *Bot) tryReact(ctx context.Context, msg *telego.Message) {
 	if msg == nil || msg.Text == "" {
 		return
@@ -296,7 +258,7 @@ func (b *Bot) tryReact(ctx context.Context, msg *telego.Message) {
 		})
 		if err != nil {
 			log.Printf("react: emoji=%s msg=%d text=%q err=%v",
-				p.emoji, msg.MessageID, truncate(msg.Text, 60), err)
+				p.emoji, msg.MessageID, textutil.Ellipsize(msg.Text, 60), err)
 			return
 		}
 		log.Printf("react: chat=%d msg=%d emoji=%s", msg.Chat.ID, msg.MessageID, p.emoji)
@@ -304,8 +266,6 @@ func (b *Bot) tryReact(ctx context.Context, msg *telego.Message) {
 	}
 }
 
-// onDemandSummary handles /summary — replies in chat with a short summary of
-// the current history. Doesn't modify stored history.
 func (b *Bot) onDemandSummary(ctx context.Context, chatID int64) {
 	if !b.claimInflight(chatID) {
 		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID),
@@ -326,10 +286,7 @@ func (b *Bot) onDemandSummary(ctx context.Context, chatID int64) {
 	}
 	history = trimHistoryByTokens(history, b.cfg.HistoryTokenBudget)
 
-	llmMsgs := []llm.Message{{Role: "system", Content: b.loadSystemPrompt()}}
-	for _, m := range history {
-		llmMsgs = append(llmMsgs, llm.Message{Role: m.Role, Content: m.Content})
-	}
+	llmMsgs := buildLLMMessages(b.loadSystemPrompt(), history)
 	llmMsgs = append(llmMsgs, llm.Message{
 		Role: "user",
 		Content: "[SISTEMA] Resumí la conversación de arriba en 2-3 oraciones bien cortas, " +
@@ -348,19 +305,14 @@ func (b *Bot) onDemandSummary(ctx context.Context, chatID int64) {
 	if final == "" {
 		final = "(nada para resumir)"
 	}
-	if len(final) > maxMsgLen {
-		final = final[:maxMsgLen] + "..."
-	}
+	final = textutil.Ellipsize(final, maxMsgLen)
 	_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), final))
-	log.Printf("summary reply: chat=%d text=%q", chatID, truncate(final, 200))
+	log.Printf("summary reply: chat=%d text=%q", chatID, textutil.Ellipsize(final, 200))
 }
 
-// maybeAutoSummarize fires an async background summarizer if the stored
-// history exceeds autoSummaryAtMessages, none is already running, and the
-// per-chat cooldown has elapsed.
 func (b *Bot) maybeAutoSummarize(chatID int64) {
-	msgs, err := b.store.Load(chatID)
-	if err != nil || len(msgs) < autoSummaryAtMessages {
+	n, err := b.store.Count(chatID)
+	if err != nil || n < autoSummaryAtMessages {
 		return
 	}
 	b.summarizingMu.Lock()
@@ -378,9 +330,6 @@ func (b *Bot) maybeAutoSummarize(chatID int64) {
 	go b.autoSummarize(chatID)
 }
 
-// cancelAutoSummary stops a running auto-summary for this chat (if any) so
-// that a freshly-arrived addressed user message can grab the inflight lock
-// quickly. Safe to call when no summary is running.
 func (b *Bot) cancelAutoSummary(chatID int64) {
 	b.summarizingMu.Lock()
 	cancel := b.summaryCancel[chatID]
@@ -394,7 +343,7 @@ func (b *Bot) cancelAutoSummary(chatID int64) {
 // single "[CONTEXTO ANTERIOR]"-prefixed user message at history[0]. Uses a
 // cancellable context so an addressed user message can interrupt it.
 func (b *Bot) autoSummarize(chatID int64) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(b.rootCtx)
 	b.summarizingMu.Lock()
 	b.summaryCancel[chatID] = cancel
 	b.summarizingMu.Unlock()
@@ -528,6 +477,7 @@ func trimHistoryByTokens(msgs []store.Message, budget int) []store.Message {
 }
 
 func (b *Bot) Run(ctx context.Context) error {
+	b.rootCtx = ctx
 	updates, err := b.tg.UpdatesViaLongPolling(ctx, nil)
 	if err != nil {
 		return err
@@ -555,11 +505,10 @@ func (b *Bot) handle(ctx context.Context, msg *telego.Message) {
 	isGroup := msg.Chat.Type != telego.ChatTypePrivate
 
 	log.Printf("recv: chat=%d (%s) from=%d (%s) text=%q",
-		msg.Chat.ID, msg.Chat.Type, msg.From.ID, msg.From.Username, truncate(text, 80))
+		msg.Chat.ID, msg.Chat.Type, msg.From.ID, msg.From.Username, textutil.Ellipsize(text, 80))
 
-	// Detect whether the bot is being directly addressed (so we know whether
-	// to reply). In DMs every message addresses the bot. In groups: an explicit
-	// @mention, a reply to one of the bot's messages, or a slash command.
+	// In DMs every message addresses the bot. In groups: a slash command, a
+	// reply to one of the bot's messages, or an explicit @mention.
 	isCommand := strings.HasPrefix(text, "/")
 	addressed := !isGroup
 	if isGroup {
@@ -577,74 +526,68 @@ func (b *Bot) handle(ctx context.Context, msg *telego.Message) {
 		}
 	}
 
-	// Auth: user is on the user-allowlist, OR it's a group whose chat ID is allowlisted.
 	userAllowed := b.cfg.AllowedUserIDs[msg.From.ID]
 	chatAllowed := isGroup && b.cfg.AllowedChatIDs[msg.Chat.ID]
 	if !userAllowed && !chatAllowed {
-		// Stay silent for bystanders; only respond when they were trying to
-		// address the bot directly.
 		if addressed {
-			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "Not authorized."))
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "No autorizado."))
 			log.Printf("rejected user %d (%s) in chat %d", msg.From.ID, msg.From.Username, msg.Chat.ID)
 		}
 		return
 	}
 
-	// Archive every regular message (commands are transient — not saved).
-	if !isCommand && text != "" {
-		b.archiveMessage(msg.Chat.ID, msg.From, text)
-		// In groups, lightweight reactions and spontaneous-take counter run
-		// on every non-addressed message. Reactions are pattern-based (no LLM
-		// call); the spontaneous take fires when a random threshold trips.
+	if !isCommand {
+		b.appendMessage(msg.Chat.ID, store.Message{
+			Role:    "user",
+			Content: fmt.Sprintf("[%s] %s", b.speakerName(msg.From), text),
+		})
 		if isGroup && !addressed {
-			go b.tryReact(context.Background(), msg)
+			go b.tryReact(b.rootCtx, msg)
 			if b.tickSpontaneous(msg.Chat.ID) {
-				go b.spontaneousReply(context.Background(), msg.Chat.ID)
+				go b.spontaneousReply(b.rootCtx, msg.Chat.ID)
 			}
 		}
-		// Async background summarization once the chat grows past the
-		// threshold. No-op if one is already running or the chat is short.
 		b.maybeAutoSummarize(msg.Chat.ID)
 	}
 
-	// Group non-mention chatter: archived, but we don't reply.
 	if !addressed {
 		return
 	}
 
-	switch {
-	case strings.HasPrefix(text, "/start"):
-		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
-			"Hi. Ask me anything — I can search the web when I need to.\n/reset to clear memory.\n/summary for a recap of the chat.\n/status for info."))
-		return
-	case strings.HasPrefix(text, "/reset"):
-		_ = b.store.Clear(msg.Chat.ID)
-		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "Memory cleared."))
-		return
-	case strings.HasPrefix(text, "/status"):
-		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
-			fmt.Sprintf("Model: %s\nUser ID: %d\nChat ID: %d", b.cfg.ModelFile, msg.From.ID, msg.Chat.ID)))
-		return
-	case strings.HasPrefix(text, "/summary"):
-		go b.onDemandSummary(context.Background(), msg.Chat.ID)
-		return
-	}
-
-	if text == "" {
-		return
+	if isCommand {
+		cmd, _, _ := strings.Cut(text, " ")
+		cmd, _, _ = strings.Cut(cmd, "@")
+		switch cmd {
+		case "/start":
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
+				"Hola. Preguntame lo que quieras — busco en la web cuando hace falta.\n/reset para borrar la memoria.\n/summary para un resumen del chat.\n/status para info."))
+			return
+		case "/reset":
+			_ = b.store.Clear(msg.Chat.ID)
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "Memoria borrada."))
+			return
+		case "/status":
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
+				fmt.Sprintf("Model: %s\nUser ID: %d\nChat ID: %d", b.cfg.ModelFile, msg.From.ID, msg.Chat.ID)))
+			return
+		case "/summary":
+			go b.onDemandSummary(b.rootCtx, msg.Chat.ID)
+			return
+		}
+		// Unknown slash command — fall through and let the model see it.
 	}
 
 	// User addressed the bot — pre-empt any background summary so we serve
 	// the user promptly instead of making them wait minutes behind it.
 	b.cancelAutoSummary(msg.Chat.ID)
 
-	if err := b.respond(ctx, msg, text); err != nil {
+	if err := b.respond(ctx, msg); err != nil {
 		log.Printf("respond: %v", err)
 		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), genericErrorMsg))
 	}
 }
 
-func (b *Bot) respond(ctx context.Context, msg *telego.Message, userText string) error {
+func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	if !b.claimInflight(msg.Chat.ID) {
 		log.Printf("skip: chat=%d already has an inference in flight", msg.Chat.ID)
 		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
@@ -653,21 +596,14 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message, userText string)
 	}
 	defer b.releaseInflight(msg.Chat.ID)
 
-	systemPrompt := b.loadSystemPrompt()
-
-	// The user's current message has already been archived by handle().
 	history, err := b.store.Load(msg.Chat.ID)
 	if err != nil {
 		return fmt.Errorf("load history: %w", err)
 	}
 	history = trimHistoryByTokens(history, b.cfg.HistoryTokenBudget)
+	llmMsgs := buildLLMMessages(b.loadSystemPrompt(), history)
 
-	llmMsgs := []llm.Message{{Role: "system", Content: systemPrompt}}
-	for _, m := range history {
-		llmMsgs = append(llmMsgs, llm.Message{Role: m.Role, Content: m.Content})
-	}
-
-	placeholder, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "Thinking..."))
+	placeholder, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "Pensando..."))
 	if err != nil {
 		return fmt.Errorf("send placeholder: %w", err)
 	}
@@ -686,15 +622,13 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message, userText string)
 		return nil
 	}
 	if strings.TrimSpace(final) == "" {
-		final = "(empty response)"
+		final = "(respuesta vacía)"
 	}
-	if len(final) > maxMsgLen {
-		final = final[:maxMsgLen] + "..."
-	}
-	log.Printf("reply: chat=%d text=%q", msg.Chat.ID, truncate(final, 200))
+	final = textutil.Ellipsize(final, maxMsgLen)
+	log.Printf("reply: chat=%d text=%q", msg.Chat.ID, textutil.Ellipsize(final, 200))
 	s.replace(final)
 
-	b.appendAssistant(msg.Chat.ID, final)
+	b.appendMessage(msg.Chat.ID, store.Message{Role: "assistant", Content: final})
 	return nil
 }
 
@@ -714,7 +648,7 @@ func (b *Bot) runTurn(ctx context.Context, msgs []llm.Message, s *streamer) (str
 			ToolCalls: calls,
 		})
 		for _, c := range calls {
-			log.Printf("tool: %s(%s)", c.Function.Name, truncate(c.Function.Arguments, 200))
+			log.Printf("tool: %s(%s)", c.Function.Name, textutil.Ellipsize(c.Function.Arguments, 200))
 			result := b.tools.Execute(ctx, c)
 			msgs = append(msgs, llm.Message{
 				Role:       "tool",
@@ -752,16 +686,38 @@ func (b *Bot) keepTyping(ctx context.Context, chatID int64) {
 }
 
 func (b *Bot) loadSystemPrompt() string {
+	prompt := b.cachedSystemPrompt()
+	return strings.ReplaceAll(prompt, "{date}", time.Now().UTC().Format("2006-01-02"))
+}
+
+// cachedSystemPrompt returns the system-prompt file content, re-reading only
+// when the file's mtime changes. Avoids per-turn disk I/O.
+func (b *Bot) cachedSystemPrompt() string {
+	info, err := os.Stat(b.cfg.SystemPromptPath)
+	if err != nil {
+		return "You are a helpful assistant."
+	}
+	mtime := info.ModTime()
+	b.promptMu.RLock()
+	if !mtime.After(b.promptMtime) && b.promptCached != "" {
+		s := b.promptCached
+		b.promptMu.RUnlock()
+		return s
+	}
+	b.promptMu.RUnlock()
+
 	raw, err := os.ReadFile(b.cfg.SystemPromptPath)
 	if err != nil {
 		return "You are a helpful assistant."
 	}
-	prompt := string(raw)
-	prompt = strings.ReplaceAll(prompt, "{date}", time.Now().UTC().Format("2006-01-02"))
-	return prompt
+	s := string(raw)
+	b.promptMu.Lock()
+	b.promptCached = s
+	b.promptMtime = mtime
+	b.promptMu.Unlock()
+	return s
 }
 
-// Rotating placeholders shown while the model is busy
 var busyGerunds = []string{
 	"Thinking",
 	"Cogitating",
@@ -800,50 +756,47 @@ func toolPhrase(name string) string {
 type streamerState int
 
 const (
-	stateBusy streamerState = iota // waiting for first token / prompt eval
-	stateTool                      // tool is executing
-	stateText                      // tokens are streaming in
+	stateBusy streamerState = iota
+	stateTool
+	stateText
 )
 
-// streamer manages bot output during one turn: a "placeholder" message shows
-// status (Thinking..., Searching the web...) while one or more "text" messages
-// carry the actual streamed content. After every state change to text (initial
-// or post-tool), the streamer sends a NEW Telegram message and edits that one
-// instead of the placeholder, so each content phase gets its own edit budget
-// and Telegram rate-limiting can't truncate the final reply.
+// streamer manages bot output during one turn: the "placeholder" message shows
+// status (Pensando..., Searching the web...) while one or more "text" messages
+// carry the streamed content. Each content phase (initial, post-tool-1, ...)
+// gets its own freshly-sent message so Telegram's per-message edit rate-limit
+// can't truncate the final reply.
 type streamer struct {
 	ctx           context.Context
 	tg            *telego.Bot
 	chatID        int64
 	placeholderID int // status indicator — edited by renderStatus only
-	messageID     int // current text target — placeholder until first text chunk
+	messageID     int // current text target; == placeholderID ⇒ next text chunk starts a new message
 
-	mu              sync.Mutex
-	state           streamerState
-	buf             strings.Builder
-	phaseStart      time.Time
-	toolName        string
-	lastFlush       time.Time
-	needsNewMessage bool // true → next text chunk creates a new message
+	mu         sync.Mutex
+	state      streamerState
+	buf        strings.Builder
+	phaseStart time.Time
+	toolName   string
+	lastFlush  time.Time
 
-	editMu   sync.Mutex // serializes edit calls + lastSent
-	lastSent string     // last text successfully sent to messageID
+	editMu   sync.Mutex
+	lastSent string
 
 	done chan struct{}
 }
 
 func newStreamer(ctx context.Context, tg *telego.Bot, chatID int64, messageID int) *streamer {
 	s := &streamer{
-		ctx:             ctx,
-		tg:              tg,
-		chatID:          chatID,
-		placeholderID:   messageID,
-		messageID:       messageID,
-		state:           stateBusy,
-		phaseStart:      time.Now(),
-		lastFlush:       time.Now(),
-		needsNewMessage: true,
-		done:            make(chan struct{}),
+		ctx:           ctx,
+		tg:            tg,
+		chatID:        chatID,
+		placeholderID: messageID,
+		messageID:     messageID,
+		state:         stateBusy,
+		phaseStart:    time.Now(),
+		lastFlush:     time.Now(),
+		done:          make(chan struct{}),
 	}
 	go s.tickLoop()
 	return s
@@ -864,19 +817,14 @@ func (s *streamer) tickLoop() {
 	}
 }
 
-// editStatus updates the placeholder message used for status indicators.
-// Has its own lastSent tracking so it doesn't interfere with text edits.
 func (s *streamer) editStatus(text string) {
 	if text == "" {
 		return
 	}
-	if len(text) > maxMsgLen {
-		text = text[:maxMsgLen] + "..."
-	}
 	_, err := s.tg.EditMessageText(s.ctx, &telego.EditMessageTextParams{
 		ChatID:    tu.ID(s.chatID),
 		MessageID: s.placeholderID,
-		Text:      text,
+		Text:      textutil.Ellipsize(text, maxMsgLen),
 	})
 	if err != nil {
 		errStr := err.Error()
@@ -900,33 +848,28 @@ func (s *streamer) renderStatus() {
 		s.editStatus(fmt.Sprintf("%s... (%ds)", gerundFor(start), elapsed))
 	case stateTool:
 		s.editStatus(fmt.Sprintf("%s... (%ds)", toolPhrase(tool), elapsed))
-	case stateText:
-		// Text streaming flushes itself; nothing to do here.
 	}
 }
 
 func (s *streamer) OnText(delta string) {
 	s.mu.Lock()
-	if s.needsNewMessage && strings.TrimSpace(delta) != "" {
-		s.needsNewMessage = false
+	// First non-blank delta of a content phase: send a brand-new Telegram
+	// message so each phase has its own per-message edit budget. messageID
+	// equal to placeholderID means we're at the start of a phase.
+	if s.messageID == s.placeholderID && strings.TrimSpace(delta) != "" {
 		s.state = stateText
 		s.buf.Reset()
 		s.buf.WriteString(delta)
 		s.lastFlush = time.Now()
 		s.mu.Unlock()
-		// Send a fresh message for this text phase so it has its own edit
-		// budget. Subsequent OnText deltas edit this new message. If send
-		// fails (e.g. 429 — Telegram rate-limits sendMessage separately from
-		// edits), fall back to editing the placeholder so we don't drop the
-		// text. messageID stays pointed at the placeholder in that case.
 		sent, err := s.tg.SendMessage(s.ctx, tu.Message(tu.ID(s.chatID), delta))
 		if err != nil {
+			// 429 on sendMessage falls back to editing the placeholder so
+			// the text isn't dropped. messageID stays at placeholderID.
 			log.Printf("OnText send (falling back to edit): %v", err)
-			s.mu.Lock()
 			s.editMu.Lock()
 			s.lastSent = ""
 			s.editMu.Unlock()
-			s.mu.Unlock()
 			return
 		}
 		s.mu.Lock()
@@ -955,32 +898,29 @@ func (s *streamer) OnToolStart(name string) {
 	s.renderStatus()
 }
 
-// reset is called after a tool round finishes; we go back to "busy" while the
-// model thinks about the tool result, with a fresh phase timer. The next text
-// chunk will be sent as a new message instead of editing the previous one.
+// reset signals the start of a new content phase (after a tool round).
+// Setting messageID back to placeholderID tells OnText/replace to send a new
+// Telegram message for the next text instead of editing the previous one.
 func (s *streamer) reset() {
 	s.mu.Lock()
 	s.buf.Reset()
 	s.state = stateBusy
 	s.phaseStart = time.Now()
 	s.toolName = ""
-	s.needsNewMessage = true
+	s.messageID = s.placeholderID
 	s.editMu.Lock()
 	s.lastSent = ""
 	s.editMu.Unlock()
 	s.mu.Unlock()
 }
 
-// replace sets the final text. If no text message has been created yet (e.g.
-// model returned without streaming any tokens), sends a new message; otherwise
-// edits the current text message with the final canonical content.
 func (s *streamer) replace(text string) {
 	s.mu.Lock()
-	needsNew := s.needsNewMessage
-	s.needsNewMessage = false
+	needsNew := s.messageID == s.placeholderID
 	s.state = stateText
+	// Clear buf so the deferred Close()→flush() doesn't overwrite text with
+	// a stale streaming chunk.
 	s.buf.Reset()
-	s.buf.WriteString(text)
 	s.mu.Unlock()
 	if needsNew {
 		sent, err := s.tg.SendMessage(s.ctx, tu.Message(tu.ID(s.chatID), text))
@@ -1025,9 +965,7 @@ func (s *streamer) editTo(text string) {
 	if text == s.lastSent {
 		return
 	}
-	if len(text) > maxMsgLen {
-		text = text[:maxMsgLen] + "..."
-	}
+	text = textutil.Ellipsize(text, maxMsgLen)
 	for attempt := 0; attempt < 3; attempt++ {
 		_, err := s.tg.EditMessageText(s.ctx, &telego.EditMessageTextParams{
 			ChatID:    tu.ID(s.chatID),
@@ -1047,26 +985,13 @@ func (s *streamer) editTo(text string) {
 			continue
 		}
 		log.Printf("editTo: msg=%d attempt=%d err=%v text=%q",
-			s.messageID, attempt, err, truncate(text, 80))
+			s.messageID, attempt, err, textutil.Ellipsize(text, 80))
 		return
 	}
 }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
-
-// speakerName returns a short label for a Telegram user used to tag messages
-// forwarded to the LLM. Resolution order:
-//  1. Override from the mapping file at cfg.UserNamesPath (JSON object
-//     keyed by user ID as a string, e.g. {"123": "Pibe"}). Re-read each
-//     call so edits take effect without a restart.
-//  2. Telegram's FirstName.
-//  3. Telegram's Username.
-//  4. Literal "user".
+// Resolution order: user-names.json override, FirstName, Username, "user".
+// The override file is hot-reloaded so edits take effect without a restart.
 func (b *Bot) speakerName(u *telego.User) string {
 	if u == nil {
 		return "user"
@@ -1103,13 +1028,35 @@ func sanitizeSpeaker(s string) string {
 }
 
 func (b *Bot) loadUserNameOverride(id int64) string {
+	m := b.cachedUserNames()
+	return strings.TrimSpace(m[strconv.FormatInt(id, 10)])
+}
+
+func (b *Bot) cachedUserNames() map[string]string {
+	info, err := os.Stat(b.cfg.UserNamesPath)
+	if err != nil {
+		return nil
+	}
+	mtime := info.ModTime()
+	b.namesMu.RLock()
+	if !mtime.After(b.namesMtime) && b.namesCached != nil {
+		m := b.namesCached
+		b.namesMu.RUnlock()
+		return m
+	}
+	b.namesMu.RUnlock()
+
 	raw, err := os.ReadFile(b.cfg.UserNamesPath)
 	if err != nil {
-		return ""
+		return nil
 	}
 	var m map[string]string
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return ""
+		return nil
 	}
-	return strings.TrimSpace(m[strconv.FormatInt(id, 10)])
+	b.namesMu.Lock()
+	b.namesCached = m
+	b.namesMtime = mtime
+	b.namesMu.Unlock()
+	return m
 }

@@ -15,6 +15,7 @@ import (
 	readability "github.com/go-shiori/go-readability"
 
 	"llm-telegram-bot/internal/llm"
+	"llm-telegram-bot/internal/textutil"
 )
 
 const (
@@ -207,57 +208,69 @@ func (r *Registry) Definitions() []llm.Tool {
 }
 
 func (r *Registry) Execute(ctx context.Context, call llm.ToolCall) string {
+	raw := call.Function.Arguments
 	switch call.Function.Name {
 	case "search_web":
-		var args struct {
+		var a struct {
 			Query string `json:"query"`
 		}
-		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || strings.TrimSpace(args.Query) == "" {
+		if !parseArgs(raw, &a, &a.Query) {
 			return `Error: invalid arguments. Expected {"query": "..."}.`
 		}
-		return r.searchWeb(ctx, args.Query)
+		return r.searchWeb(ctx, a.Query)
 	case "fetch_url":
-		var args struct {
+		var a struct {
 			URL string `json:"url"`
 		}
-		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || strings.TrimSpace(args.URL) == "" {
+		if !parseArgs(raw, &a, &a.URL) {
 			return `Error: invalid arguments. Expected {"url": "..."}.`
 		}
-		return r.fetchURL(ctx, args.URL)
+		return r.fetchURL(ctx, a.URL)
 	case "get_weather":
-		var args struct {
+		var a struct {
 			Location string `json:"location"`
 		}
-		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || strings.TrimSpace(args.Location) == "" {
+		if !parseArgs(raw, &a, &a.Location) {
 			return `Error: invalid arguments. Expected {"location": "..."}.`
 		}
-		return r.getFromDataAPI(ctx, "/weather", "location", args.Location)
+		return r.getFromDataAPI(ctx, "/weather", "location", a.Location)
 	case "get_crypto_price":
-		var args struct {
+		var a struct {
 			Symbol string `json:"symbol"`
 		}
-		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || strings.TrimSpace(args.Symbol) == "" {
+		if !parseArgs(raw, &a, &a.Symbol) {
 			return `Error: invalid arguments. Expected {"symbol": "..."}.`
 		}
-		return r.getFromDataAPI(ctx, "/crypto", "symbol", args.Symbol)
+		return r.getFromDataAPI(ctx, "/crypto", "symbol", a.Symbol)
 	case "get_exchange_rate":
-		var args struct {
+		var a struct {
 			From string `json:"from"`
 			To   string `json:"to"`
 		}
-		if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil ||
-			strings.TrimSpace(args.From) == "" || strings.TrimSpace(args.To) == "" {
+		if !parseArgs(raw, &a, &a.From, &a.To) {
 			return `Error: invalid arguments. Expected {"from": "...", "to": "..."}.`
 		}
-		return r.getFromDataAPI(ctx, "/fx", "from", args.From, "to", args.To)
+		return r.getFromDataAPI(ctx, "/fx", "from", a.From, "to", a.To)
 	default:
 		return "Error: unknown tool " + call.Function.Name
 	}
 }
 
-// getFromDataAPI calls the data-api service and returns its JSON response (or
-// error message) as a raw string for the LLM to read. Variadic kvs are
-// pairs of query-string key/value.
+// parseArgs unmarshals raw into dst and verifies each required field is
+// non-empty after trimming. Pass field pointers so they're dereferenced
+// AFTER Unmarshal has populated them.
+func parseArgs(raw string, dst any, required ...*string) bool {
+	if err := json.Unmarshal([]byte(raw), dst); err != nil {
+		return false
+	}
+	for _, p := range required {
+		if strings.TrimSpace(*p) == "" {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *Registry) getFromDataAPI(ctx context.Context, path string, kvs ...string) string {
 	if r.dataAPIURL == "" {
 		return "Error: data-api not configured"
@@ -305,7 +318,7 @@ func (r *Registry) searchWeb(ctx context.Context, query string) string {
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Sprintf("Error: search HTTP %d: %s", resp.StatusCode, truncate(string(b), 200))
+		return fmt.Sprintf("Error: search HTTP %d: %s", resp.StatusCode, textutil.Ellipsize(string(b), 200))
 	}
 	var sr searxResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, searchBodyLimit)).Decode(&sr); err != nil {
@@ -319,7 +332,7 @@ func (r *Registry) searchWeb(ctx context.Context, query string) string {
 		if i >= maxSearchResults {
 			break
 		}
-		fmt.Fprintf(&b, "[%d] %s\n%s\n%s\n\n", i+1, res.Title, res.URL, truncate(strings.TrimSpace(res.Content), 300))
+		fmt.Fprintf(&b, "[%d] %s\n%s\n%s\n\n", i+1, res.Title, res.URL, textutil.Ellipsize(strings.TrimSpace(res.Content), 300))
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -347,12 +360,5 @@ func (r *Registry) fetchURL(ctx context.Context, raw string) string {
 	if text == "" {
 		return "Error: no readable text extracted."
 	}
-	return fmt.Sprintf("Title: %s\nURL: %s\n\n%s", article.Title, raw, truncate(text, maxFetchBytes))
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
+	return fmt.Sprintf("Title: %s\nURL: %s\n\n%s", article.Title, raw, textutil.Ellipsize(text, maxFetchBytes))
 }

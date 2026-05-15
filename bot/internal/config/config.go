@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -36,8 +37,14 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
 	}
 
-	budget, _ := strconv.Atoi(getenv("HISTORY_TOKEN_BUDGET", "2500"))
+	rawBudget := getenv("HISTORY_TOKEN_BUDGET", "2500")
+	budget, err := strconv.Atoi(rawBudget)
+	if err != nil {
+		log.Printf("HISTORY_TOKEN_BUDGET=%q is not an integer; falling back to 2500", rawBudget)
+		budget = 2500
+	}
 	if budget < 200 {
+		log.Printf("HISTORY_TOKEN_BUDGET=%d below 200 minimum; using 2500", budget)
 		budget = 2500
 	}
 	c.HistoryTokenBudget = budget
