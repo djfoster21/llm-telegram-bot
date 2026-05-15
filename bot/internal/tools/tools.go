@@ -15,6 +15,7 @@ import (
 	readability "github.com/go-shiori/go-readability"
 
 	"llm-telegram-bot/internal/llm"
+	"llm-telegram-bot/internal/store"
 	"llm-telegram-bot/internal/textutil"
 )
 
@@ -25,17 +26,44 @@ const (
 	searchBodyLimit  = 4 * 1024 * 1024
 )
 
+type ctxKey int
+
+const (
+	ctxKeyChat ctxKey = iota
+	ctxKeyUser
+)
+
+// WithChat attaches chat and user IDs to ctx so tools that need them
+// (recall, set_reminder) can read them inside Execute.
+func WithChat(ctx context.Context, chatID, userID int64) context.Context {
+	ctx = context.WithValue(ctx, ctxKeyChat, chatID)
+	ctx = context.WithValue(ctx, ctxKeyUser, userID)
+	return ctx
+}
+
+func chatIDFromContext(ctx context.Context) (int64, bool) {
+	v, ok := ctx.Value(ctxKeyChat).(int64)
+	return v, ok
+}
+
+func userIDFromContext(ctx context.Context) (int64, bool) {
+	v, ok := ctx.Value(ctxKeyUser).(int64)
+	return v, ok
+}
+
 type Registry struct {
 	searxngURL string
 	dataAPIURL string
+	store      *store.Store
 	http       *http.Client // for internal services (searxng, data-api)
 	fetch      *http.Client // for fetch_url: SSRF-guarded against non-public IPs
 }
 
-func New(searxngURL, dataAPIURL string) *Registry {
+func New(searxngURL, dataAPIURL string, db *store.Store) *Registry {
 	return &Registry{
 		searxngURL: strings.TrimRight(searxngURL, "/"),
 		dataAPIURL: strings.TrimRight(dataAPIURL, "/"),
+		store:      db,
 		http:       &http.Client{Timeout: 25 * time.Second},
 		fetch:      newFetchClient(),
 	}
@@ -183,6 +211,52 @@ func (r *Registry) Definitions() []llm.Tool {
 		{
 			Type: "function",
 			Function: llm.ToolDefinition{
+				Name: "recall",
+				Description: "Search your long-term memory of past messages in THIS chat. " +
+					"Use when the user asks about something said before — possibly weeks or months ago — " +
+					"that may have fallen out of the live conversation window. " +
+					"Returns up to 5 matching messages with timestamps. " +
+					"Examples: \"qué dijo Pibe sobre el viaje a Mar del Plata\", \"el chiste de la suegra\", " +
+					"\"cuándo era el cumple de Capo\".",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query": map[string]any{
+							"type":        "string",
+							"description": "Keywords to search for. FTS5 syntax. 1-5 words usually. Example: \"Mar del Plata viaje\".",
+						},
+					},
+					"required": []string{"query"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: llm.ToolDefinition{
+				Name: "set_reminder",
+				Description: "Schedule a reminder message to be posted in THIS chat at a specific time. " +
+					"Use whenever the user asks you to remind them of something. " +
+					"The bot will send the reminder text at the chosen time, mentioning the user who set it. " +
+					"Examples: \"recordame el viernes a las 8pm de comprar vino\", \"avisame en 1 hora\".",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"fire_at": map[string]any{
+							"type":        "string",
+							"description": "RFC3339 timestamp WITH timezone offset, e.g. \"2026-05-22T20:00:00-03:00\". Must be in the future. Argentina is UTC-3.",
+						},
+						"text": map[string]any{
+							"type":        "string",
+							"description": "What to remind the user about. Short, in the user's language. Example: \"comprar vino para la cena\".",
+						},
+					},
+					"required": []string{"fire_at", "text"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: llm.ToolDefinition{
 				Name: "get_exchange_rate",
 				Description: "Get currency conversion rate. PREFER this over search_web for any exchange-rate question. " +
 					"Special case: from=USD to=ARS returns ALL the Argentinian variants (oficial, blue, mep, ccl, tarjeta, mayorista, cripto) — the user usually wants 'blue'. " +
@@ -251,9 +325,83 @@ func (r *Registry) Execute(ctx context.Context, call llm.ToolCall) string {
 			return `Error: invalid arguments. Expected {"from": "...", "to": "..."}.`
 		}
 		return r.getFromDataAPI(ctx, "/fx", "from", a.From, "to", a.To)
+	case "recall":
+		var a struct{ Query string `json:"query"` }
+		if !parseArgs(raw, &a, &a.Query) {
+			return `Error: invalid arguments. Expected {"query": "..."}.`
+		}
+		return r.recall(ctx, a.Query)
+	case "set_reminder":
+		var a struct {
+			FireAt string `json:"fire_at"`
+			Text   string `json:"text"`
+		}
+		if !parseArgs(raw, &a, &a.FireAt, &a.Text) {
+			return `Error: invalid arguments. Expected {"fire_at": "RFC3339", "text": "..."}.`
+		}
+		return r.setReminder(ctx, a.FireAt, a.Text)
 	default:
 		return "Error: unknown tool " + call.Function.Name
 	}
+}
+
+func (r *Registry) recall(ctx context.Context, query string) string {
+	if r.store == nil {
+		return "Error: memoria no disponible."
+	}
+	chatID, ok := chatIDFromContext(ctx)
+	if !ok {
+		return "Error: contexto de chat no disponible."
+	}
+	hits, err := r.store.Search(chatID, query, 5)
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	if len(hits) == 0 {
+		return "Nada encontrado para esa búsqueda."
+	}
+	loc, _ := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if loc == nil {
+		loc = time.UTC
+	}
+	var b strings.Builder
+	for i, h := range hits {
+		fmt.Fprintf(&b, "[%d] %s (%s)\n%s\n\n",
+			i+1,
+			h.TS.In(loc).Format("2006-01-02 15:04"),
+			h.Role,
+			textutil.Ellipsize(strings.TrimSpace(h.Content), 300),
+		)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func (r *Registry) setReminder(ctx context.Context, fireAtRaw, text string) string {
+	if r.store == nil {
+		return "Error: recordatorios no disponibles."
+	}
+	chatID, ok := chatIDFromContext(ctx)
+	if !ok {
+		return "Error: contexto de chat no disponible."
+	}
+	userID, _ := userIDFromContext(ctx)
+	fireAt, err := time.Parse(time.RFC3339, fireAtRaw)
+	if err != nil {
+		return "Error: fire_at debe ser RFC3339 con zona horaria (ej. 2026-05-22T20:00:00-03:00)."
+	}
+	if !fireAt.After(time.Now()) {
+		return "Error: fire_at tiene que ser en el futuro."
+	}
+	id, err := r.store.CreateReminder(chatID, userID, fireAt, text)
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	loc, _ := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if loc == nil {
+		loc = time.UTC
+	}
+	return fmt.Sprintf("Recordatorio #%d agendado para %s: %s",
+		id, fireAt.In(loc).Format("2006-01-02 15:04 -0700"), text)
 }
 
 // parseArgs unmarshals raw into dst and verifies each required field is

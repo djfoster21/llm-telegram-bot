@@ -24,8 +24,15 @@ import (
 )
 
 const (
-	maxToolRounds     = 4
-	streamInterval    = 1100 * time.Millisecond
+	maxToolRounds  = 4
+	streamInterval = 2500 * time.Millisecond
+	// editMaxAttempts is for streaming previews — those are best-effort, so
+	// failing after a few retries is OK. The final replace() uses its own
+	// fallback (send a new message) so the user always sees the full reply.
+	editMaxAttempts = 3
+	// editMaxRetryWait caps per-attempt sleeps on 429 so editTo (called from
+	// the LLM scanner loop via OnText→flush) can't stall the stream.
+	editMaxRetryWait  = 3 * time.Second
 	maxMsgLen         = 4000
 	maxStoredMessages = 300
 
@@ -42,6 +49,31 @@ const (
 	// User-facing error string. Internal errors are logged but never surfaced
 	// because they can leak hostnames, paths, or upstream tokens.
 	genericErrorMsg = "Uy, se me colgó algo. Probá de nuevo."
+
+	helpText = `Bot conversacional con persona rioplatense. Estas son las cosas que puedo hacer:
+
+*Comandos:*
+/start — saludo inicial
+/help — esta ayuda
+/summary — resumen corto de la conversación actual
+/reset — borra la memoria de este chat
+/status — info técnica (modelo, IDs)
+
+*Herramientas que uso solo cuando hace falta:*
+• Búsqueda web en vivo (clima, noticias, cotizaciones, datos varios)
+• Lectura de páginas web por URL
+• Clima actual y pronóstico para cualquier ciudad
+• Precio de criptomonedas (BTC, ETH, etc.) en USD y ARS
+• Tipo de cambio (USD→ARS con todas las variantes: oficial, blue, MEP, CCL, tarjeta, mayorista, cripto; o cualquier par de monedas)
+• Recordatorios — pedime “recordame el viernes a las 8 que…” y te aviso a esa hora
+• Memoria larga — busco en lo que se dijo antes en este chat, aunque haya pasado mucho tiempo
+
+*Extras en grupos:*
+• Reacciono con emojis a algunos mensajes
+• A veces tiro un comentario sin que me llamen
+• Resumo solo el chat cuando se hace muy largo, para no perder contexto
+
+Para hablarme en un grupo: mencioname con @, contestá un mensaje mío, o usá un comando.`
 )
 
 // Order matters — first match wins.
@@ -159,6 +191,10 @@ func (b *Bot) appendMessage(chatID int64, m store.Message) {
 	if err := b.store.Save(chatID, msgs); err != nil {
 		log.Printf("append save: %v", err)
 	}
+	// Long-term FTS index — survives history trim, used by the `recall` tool.
+	if err := b.store.IndexMessage(chatID, m.Role, m.Content, time.Now()); err != nil {
+		log.Printf("append index: %v", err)
+	}
 }
 
 func (b *Bot) tickSpontaneous(chatID int64) bool {
@@ -207,7 +243,7 @@ func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
 		return
 	}
 
-	llmMsgs := buildLLMMessages(b.loadSystemPrompt(), history)
+	llmMsgs := buildLLMMessages(b.systemPromptForChat(chatID), history)
 	llmMsgs = append(llmMsgs, llm.Message{
 		Role: "user",
 		Content: "[SISTEMA] Sumate a la conversación como un amigo más, sin que nadie te invite. " +
@@ -286,7 +322,7 @@ func (b *Bot) onDemandSummary(ctx context.Context, chatID int64) {
 	}
 	history = trimHistoryByTokens(history, b.cfg.HistoryTokenBudget)
 
-	llmMsgs := buildLLMMessages(b.loadSystemPrompt(), history)
+	llmMsgs := buildLLMMessages(b.systemPromptForChat(chatID), history)
 	llmMsgs = append(llmMsgs, llm.Message{
 		Role: "user",
 		Content: "[SISTEMA] Resumí la conversación de arriba en 2-3 oraciones bien cortas, " +
@@ -396,7 +432,7 @@ func (b *Bot) autoSummarize(chatID int64) {
 	toCompress := msgs[:len(msgs)-autoSummaryKeepRecent]
 	keep := msgs[len(msgs)-autoSummaryKeepRecent:]
 
-	llmMsgs := []llm.Message{{Role: "system", Content: b.loadSystemPrompt()}}
+	llmMsgs := []llm.Message{{Role: "system", Content: b.systemPromptForChat(chatID)}}
 	if existingSummary != nil {
 		llmMsgs = append(llmMsgs, llm.Message{Role: "user", Content: existingSummary.Content})
 	}
@@ -484,6 +520,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 	log.Printf("bot @%s started", b.username)
 
+	go b.reminderLoop(ctx)
+
 	for upd := range updates {
 		if upd.Message == nil {
 			continue
@@ -493,16 +531,83 @@ func (b *Bot) Run(ctx context.Context) error {
 	return nil
 }
 
+// reminderLoop polls the reminders table every 30s. Each due reminder is
+// posted to its chat and deleted. Runs until ctx is cancelled.
+func (b *Bot) reminderLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	check := func() {
+		due, err := b.store.DueReminders(time.Now())
+		if err != nil {
+			log.Printf("reminder loop: %v", err)
+			return
+		}
+		for _, r := range due {
+			msg := "⏰ " + r.Text
+			if _, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(r.ChatID), msg)); err != nil {
+				log.Printf("reminder send: chat=%d id=%d err=%v", r.ChatID, r.ID, err)
+				// Leave it in the table so we try again next tick.
+				continue
+			}
+			if err := b.store.DeleteReminder(r.ID); err != nil {
+				log.Printf("reminder delete: id=%d err=%v", r.ID, err)
+			}
+			b.appendMessage(r.ChatID, store.Message{Role: "assistant", Content: msg})
+			log.Printf("reminder fired: chat=%d id=%d", r.ChatID, r.ID)
+		}
+	}
+	check()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
+		}
+	}
+}
+
 func (b *Bot) handle(ctx context.Context, msg *telego.Message) {
 	if msg.From == nil {
 		return
 	}
+
+	isGroup := msg.Chat.Type != telego.ChatTypePrivate
+
+	// Membership bookkeeping runs before the text early-return because join/
+	// leave service messages usually carry no text.
+	if isGroup {
+		if len(msg.NewChatMembers) > 0 {
+			for _, u := range msg.NewChatMembers {
+				if u.Username == b.username {
+					continue
+				}
+				if err := b.store.UpsertMember(msg.Chat.ID, u.ID, u.FirstName, u.Username); err != nil {
+					log.Printf("upsert join: %v", err)
+				} else {
+					log.Printf("member joined: chat=%d user=%d (%s)", msg.Chat.ID, u.ID, u.Username)
+				}
+			}
+		}
+		if msg.LeftChatMember != nil && msg.LeftChatMember.Username != b.username {
+			if err := b.store.RemoveMember(msg.Chat.ID, msg.LeftChatMember.ID); err != nil {
+				log.Printf("remove leave: %v", err)
+			} else {
+				log.Printf("member left: chat=%d user=%d (%s)",
+					msg.Chat.ID, msg.LeftChatMember.ID, msg.LeftChatMember.Username)
+			}
+		}
+		if msg.From.Username != b.username {
+			if err := b.store.UpsertMember(msg.Chat.ID, msg.From.ID, msg.From.FirstName, msg.From.Username); err != nil {
+				log.Printf("upsert sender: %v", err)
+			}
+		}
+	}
+
 	text := strings.TrimSpace(msg.Text)
 	if text == "" {
 		return
 	}
-
-	isGroup := msg.Chat.Type != telego.ChatTypePrivate
 
 	log.Printf("recv: chat=%d (%s) from=%d (%s) text=%q",
 		msg.Chat.ID, msg.Chat.Type, msg.From.ID, msg.From.Username, textutil.Ellipsize(text, 80))
@@ -560,7 +665,7 @@ func (b *Bot) handle(ctx context.Context, msg *telego.Message) {
 		switch cmd {
 		case "/start":
 			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
-				"Hola. Preguntame lo que quieras — busco en la web cuando hace falta.\n/reset para borrar la memoria.\n/summary para un resumen del chat.\n/status para info."))
+				"Hola. Preguntame lo que quieras — uso herramientas (web, clima, dólar, cripto, memoria, recordatorios) cuando hace falta.\nMandá /help para ver todo lo que puedo hacer."))
 			return
 		case "/reset":
 			_ = b.store.Clear(msg.Chat.ID)
@@ -572,6 +677,9 @@ func (b *Bot) handle(ctx context.Context, msg *telego.Message) {
 			return
 		case "/summary":
 			go b.onDemandSummary(b.rootCtx, msg.Chat.ID)
+			return
+		case "/help":
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), helpText))
 			return
 		}
 		// Unknown slash command — fall through and let the model see it.
@@ -601,7 +709,7 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 		return fmt.Errorf("load history: %w", err)
 	}
 	history = trimHistoryByTokens(history, b.cfg.HistoryTokenBudget)
-	llmMsgs := buildLLMMessages(b.loadSystemPrompt(), history)
+	llmMsgs := buildLLMMessages(b.systemPromptForChat(msg.Chat.ID), history)
 
 	placeholder, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "Pensando..."))
 	if err != nil {
@@ -615,7 +723,8 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	s := newStreamer(ctx, b.tg, msg.Chat.ID, placeholder.MessageID)
 	defer s.Close()
 
-	final, err := b.runTurn(ctx, llmMsgs, s)
+	turnCtx := tools.WithChat(ctx, msg.Chat.ID, msg.From.ID)
+	final, err := b.runTurn(turnCtx, llmMsgs, s)
 	if err != nil {
 		log.Printf("runTurn: chat=%d err=%v", msg.Chat.ID, err)
 		s.replace(genericErrorMsg)
@@ -688,6 +797,39 @@ func (b *Bot) keepTyping(ctx context.Context, chatID int64) {
 func (b *Bot) loadSystemPrompt() string {
 	prompt := b.cachedSystemPrompt()
 	return strings.ReplaceAll(prompt, "{date}", time.Now().UTC().Format("2006-01-02"))
+}
+
+// systemPromptForChat returns the base system prompt with a per-chat
+// "Miembros conocidos:" suffix listing the names the bot uses for each known
+// member — the same labels that appear inside `[Name] message` envelopes, so
+// the model can tie a name in the list to the speaker tag.
+func (b *Bot) systemPromptForChat(chatID int64) string {
+	prompt := b.loadSystemPrompt()
+	members, err := b.store.ListMembers(chatID)
+	if err != nil || len(members) == 0 {
+		return prompt
+	}
+	seen := map[string]bool{}
+	names := make([]string, 0, len(members))
+	for _, m := range members {
+		name := sanitizeSpeaker(b.loadUserNameOverride(m.UserID))
+		if name == "" {
+			name = sanitizeSpeaker(m.FirstName)
+		}
+		if name == "" {
+			name = sanitizeSpeaker(m.Username)
+		}
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return prompt
+	}
+	return prompt + "\n\nMiembros conocidos de este chat (los nombres entre [corchetes] de cada mensaje corresponden a estas personas): " +
+		strings.Join(names, ", ") + "."
 }
 
 // cachedSystemPrompt returns the system-prompt file content, re-reading only
@@ -914,6 +1056,10 @@ func (s *streamer) reset() {
 	s.mu.Unlock()
 }
 
+// replace delivers the final, canonical text. Must always land: if the model
+// streamed nothing, send a fresh message; if the streaming edit-budget is
+// exhausted, fall back to sending the full text as a new follow-up message
+// so the user is never left looking at a truncated streamed chunk.
 func (s *streamer) replace(text string) {
 	s.mu.Lock()
 	needsNew := s.messageID == s.placeholderID
@@ -923,22 +1069,33 @@ func (s *streamer) replace(text string) {
 	s.buf.Reset()
 	s.mu.Unlock()
 	if needsNew {
-		sent, err := s.tg.SendMessage(s.ctx, tu.Message(tu.ID(s.chatID), text))
-		if err == nil {
-			s.mu.Lock()
-			s.messageID = sent.MessageID
-			s.editMu.Lock()
-			s.lastSent = text
-			s.editMu.Unlock()
-			s.mu.Unlock()
+		if s.sendNewText(text) {
 			return
 		}
-		log.Printf("replace send (falling back to edit): %v", err)
-		s.editMu.Lock()
-		s.lastSent = ""
-		s.editMu.Unlock()
+		log.Printf("replace: send failed; falling back to editing placeholder")
 	}
-	s.editTo(text)
+	if s.editTo(text) {
+		return
+	}
+	log.Printf("replace: edit budget exhausted; sending follow-up message")
+	if !s.sendNewText(text) {
+		log.Printf("replace: follow-up send also failed; user may not see final text")
+	}
+}
+
+func (s *streamer) sendNewText(text string) bool {
+	sent, err := s.tg.SendMessage(s.ctx, tu.Message(tu.ID(s.chatID), text))
+	if err != nil {
+		log.Printf("sendNewText: %v", err)
+		return false
+	}
+	s.mu.Lock()
+	s.messageID = sent.MessageID
+	s.editMu.Lock()
+	s.lastSent = text
+	s.editMu.Unlock()
+	s.mu.Unlock()
+	return true
 }
 
 func (s *streamer) Close() {
@@ -959,14 +1116,16 @@ func (s *streamer) flush() {
 	s.mu.Unlock()
 }
 
-func (s *streamer) editTo(text string) {
+// editTo returns true when the edit (eventually) landed. On 429 it honors
+// Telegram's "retry after N" hint instead of guessing.
+func (s *streamer) editTo(text string) bool {
 	s.editMu.Lock()
 	defer s.editMu.Unlock()
 	if text == s.lastSent {
-		return
+		return true
 	}
 	text = textutil.Ellipsize(text, maxMsgLen)
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < editMaxAttempts; attempt++ {
 		_, err := s.tg.EditMessageText(s.ctx, &telego.EditMessageTextParams{
 			ChatID:    tu.ID(s.chatID),
 			MessageID: s.messageID,
@@ -974,20 +1133,51 @@ func (s *streamer) editTo(text string) {
 		})
 		if err == nil {
 			s.lastSent = text
-			return
+			return true
 		}
-		// Telegram rate-limits message edits. On 429 ("Too Many Requests"),
-		// sleep briefly and retry — losing the final edit leaves the chat
-		// showing a truncated stream chunk (e.g. just "Ni").
-		errStr := err.Error()
-		if strings.Contains(errStr, "Too Many Requests") || strings.Contains(errStr, "retry after") {
-			time.Sleep(time.Duration(1+attempt) * time.Second)
+		if wait := parseRetryAfter(err); wait > 0 {
+			if wait > editMaxRetryWait {
+				log.Printf("editTo: msg=%d 429 retry-after=%s exceeds cap; skipping",
+					s.messageID, wait)
+				return false
+			}
+			log.Printf("editTo: msg=%d 429, retry after %s (attempt %d/%d)",
+				s.messageID, wait, attempt+1, editMaxAttempts)
+			select {
+			case <-s.ctx.Done():
+				return false
+			case <-time.After(wait):
+			}
 			continue
 		}
 		log.Printf("editTo: msg=%d attempt=%d err=%v text=%q",
 			s.messageID, attempt, err, textutil.Ellipsize(text, 80))
-		return
+		return false
 	}
+	log.Printf("editTo: msg=%d gave up after %d attempts", s.messageID, editMaxAttempts)
+	return false
+}
+
+// retryAfterRE matches Telegram's "retry after N" hint embedded in 429 errors.
+var retryAfterRE = regexp.MustCompile(`retry after (\d+)`)
+
+func parseRetryAfter(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	m := retryAfterRE.FindStringSubmatch(err.Error())
+	if m == nil {
+		// Generic 429 without a hint — still back off a bit.
+		if strings.Contains(err.Error(), "Too Many Requests") {
+			return 2 * time.Second
+		}
+		return 0
+	}
+	n, e := strconv.Atoi(m[1])
+	if e != nil || n <= 0 {
+		return 2 * time.Second
+	}
+	return time.Duration(n) * time.Second
 }
 
 // Resolution order: user-names.json override, FirstName, Username, "user".

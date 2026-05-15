@@ -40,7 +40,7 @@ func main() {
 	}
 	log.Println("llama-server ready")
 
-	registry := tools.New(cfg.SearxngURL, cfg.DataAPIURL)
+	registry := tools.New(cfg.SearxngURL, cfg.DataAPIURL, db)
 
 	b, err := bot.New(cfg, db, llmClient, registry)
 	if err != nil {
