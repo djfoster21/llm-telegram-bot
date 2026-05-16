@@ -95,6 +95,7 @@ type chatRequest struct {
 	Temperature float64   `json:"temperature,omitempty"`
 	TopP        float64   `json:"top_p,omitempty"`
 	TopK        int       `json:"top_k,omitempty"`
+	MinP        float64   `json:"min_p,omitempty"`
 	// llama.cpp extension (not OpenAI). 1.0 disables it; we set explicitly
 	// because llama.cpp defaults to 1.1 which can suppress tool-call tokens.
 	RepeatPenalty float64 `json:"repeat_penalty,omitempty"`
@@ -126,10 +127,11 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 		Messages:      msgs,
 		Tools:         tools,
 		Stream:        true,
-		MaxTokens:     400, // room for preamble + tool_call block (~30-50 tok)
-		Temperature:   0.7, // Qwen 2.5 recommended
-		TopP:          0.8, // Qwen 2.5 recommended (was default ~0.95)
-		TopK:          20,  // Qwen 2.5 recommended (was default 40)
+		MaxTokens:     800, // ~3000 chars — fits comfortably under Telegram's 4096 limit
+		Temperature:   0.7, // Qwen 2.5 / Qwen 3 official recipe
+		TopP:          0.8, // Qwen 2.5 / Qwen 3 official recipe
+		TopK:          20,  // Qwen 2.5 / Qwen 3 official recipe
+		MinP:          0.0, // Qwen 3 explicit recommendation
 		RepeatPenalty: 1.0, // disable; defaults can suppress tool-call tokens
 	})
 	if err != nil {

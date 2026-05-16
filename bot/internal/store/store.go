@@ -232,11 +232,13 @@ func (s *Store) RemoveMember(chatID, userID int64) error {
 	return err
 }
 
-// ListMembers returns all known members of chatID, ordered by most recently
-// seen first.
+// ListMembers returns all known members of chatID in a stable order
+// (ascending user_id). Stable matters because the roster gets baked into the
+// system prompt — prefix-based prompt caching breaks if the names reorder
+// on every message.
 func (s *Store) ListMembers(chatID int64) ([]Member, error) {
 	rows, err := s.db.Query(
-		`SELECT user_id, first_name, username, last_seen FROM chat_members WHERE chat_id = ? ORDER BY last_seen DESC`,
+		`SELECT user_id, first_name, username, last_seen FROM chat_members WHERE chat_id = ? ORDER BY user_id`,
 		chatID,
 	)
 	if err != nil {
