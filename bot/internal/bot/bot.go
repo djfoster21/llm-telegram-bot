@@ -46,6 +46,12 @@ const (
 
 	reactionProbability = 0.4
 
+	// Warn the chat when the estimated prompt approaches llama-server's
+	// 4096-token context window. Set conservatively below the cap so we have
+	// time to react before llama-server silently truncates old turns.
+	contextWarnThreshold = 3500
+	contextWarnCooldown  = time.Hour
+
 	// User-facing error string. Internal errors are logged but never surfaced
 	// because they can leak hostnames, paths, or upstream tokens.
 	genericErrorMsg = "Uy, se me colgó algo. Probá de nuevo."
@@ -115,6 +121,11 @@ type Bot struct {
 	lastSummaryAt map[int64]time.Time
 	summaryCancel map[int64]context.CancelFunc
 
+	// Per-chat rate-limit on the "context getting full" warning we post in
+	// chat — we don't want to spam every turn once the threshold is crossed.
+	contextWarnMu sync.Mutex
+	contextWarnAt map[int64]time.Time
+
 	// mtime-keyed caches for files re-read on every turn / every message.
 	promptMu     sync.RWMutex
 	promptMtime  time.Time
@@ -150,6 +161,7 @@ func New(cfg *config.Config, db *store.Store, llmClient *llm.Client, registry *t
 		summarizing:   map[int64]bool{},
 		lastSummaryAt: map[int64]time.Time{},
 		summaryCancel: map[int64]context.CancelFunc{},
+		contextWarnAt: map[int64]time.Time{},
 	}, nil
 }
 
@@ -475,10 +487,26 @@ func (b *Bot) autoSummarize(chatID int64) {
 	log.Printf("auto-summary: chat=%d compressed %d→1 msgs", chatID, len(toCompress))
 }
 
+// estimateTokens approximates the token count of a single message body using
+// llama.cpp's rough heuristic (chars/4 + a small per-message overhead).
+// Same formula used for history trimming and for the prompt-size warning.
+func estimateTokens(content string) int {
+	return (len(content)+3)/4 + 4
+}
+
+// estimateLLMTokens sums estimateTokens across every message destined for
+// the model so we can warn before we exceed the context window.
+func estimateLLMTokens(msgs []llm.Message) int {
+	n := 0
+	for _, m := range msgs {
+		n += estimateTokens(m.Content)
+	}
+	return n
+}
+
 // trimHistoryByTokens returns the most-recent suffix of msgs whose total
-// estimated token count fits inside budget. Estimation: chars/4 + small
-// per-message overhead. If the first message is the auto-summary marker, it
-// is always preserved (its cost is deducted from the budget first).
+// estimated token count fits inside budget. If the first message is the
+// auto-summary marker it is always preserved (its cost is deducted first).
 func trimHistoryByTokens(msgs []store.Message, budget int) []store.Message {
 	if len(msgs) == 0 {
 		return msgs
@@ -487,7 +515,7 @@ func trimHistoryByTokens(msgs []store.Message, budget int) []store.Message {
 	if strings.HasPrefix(msgs[0].Content, autoSummaryMarker) {
 		s := msgs[0]
 		summary = &s
-		budget -= (len(s.Content)+3)/4 + 4
+		budget -= estimateTokens(s.Content)
 		if budget < 200 {
 			budget = 200
 		}
@@ -496,7 +524,7 @@ func trimHistoryByTokens(msgs []store.Message, budget int) []store.Message {
 	total := 0
 	var trimmed []store.Message
 	for i := len(msgs) - 1; i >= 0; i-- {
-		cost := (len(msgs[i].Content)+3)/4 + 4
+		cost := estimateTokens(msgs[i].Content)
 		if total+cost > budget {
 			trimmed = msgs[i+1:]
 			break
@@ -724,7 +752,7 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	defer s.Close()
 
 	turnCtx := tools.WithChat(ctx, msg.Chat.ID, msg.From.ID)
-	final, err := b.runTurn(turnCtx, llmMsgs, s)
+	final, err := b.runTurn(turnCtx, msg.Chat.ID, llmMsgs, s)
 	if err != nil {
 		log.Printf("runTurn: chat=%d err=%v", msg.Chat.ID, err)
 		s.replace(genericErrorMsg)
@@ -741,9 +769,40 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	return nil
 }
 
-func (b *Bot) runTurn(ctx context.Context, msgs []llm.Message, s *streamer) (string, error) {
+// warnIfContextLarge logs whenever a prompt approaches the 4096-token cap
+// and posts a one-shot Telegram warning to the chat (rate-limited per chat)
+// so the user knows old context is at risk of being silently truncated.
+func (b *Bot) warnIfContextLarge(ctx context.Context, chatID int64, msgs []llm.Message) {
+	tokens := estimateLLMTokens(msgs)
+	if tokens < contextWarnThreshold {
+		return
+	}
+	log.Printf("context warn: chat=%d est_tokens=%d threshold=%d (llama-server -c is 4096)",
+		chatID, tokens, contextWarnThreshold)
+
+	b.contextWarnMu.Lock()
+	last, ok := b.contextWarnAt[chatID]
+	if ok && time.Since(last) < contextWarnCooldown {
+		b.contextWarnMu.Unlock()
+		return
+	}
+	b.contextWarnAt[chatID] = time.Now()
+	b.contextWarnMu.Unlock()
+
+	msg := fmt.Sprintf(
+		"Che, este chat se está poniendo largo (≈%d tokens, el límite del modelo son ~4096). "+
+			"Si querés que mantenga la memoria reciente, mandá /reset.",
+		tokens,
+	)
+	if _, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), msg)); err != nil {
+		log.Printf("context warn send: %v", err)
+	}
+}
+
+func (b *Bot) runTurn(ctx context.Context, chatID int64, msgs []llm.Message, s *streamer) (string, error) {
 	defs := b.tools.Definitions()
 	for round := 0; round < maxToolRounds; round++ {
+		b.warnIfContextLarge(ctx, chatID, msgs)
 		text, calls, err := b.llm.Chat(ctx, msgs, defs, s)
 		if err != nil {
 			return "", err
