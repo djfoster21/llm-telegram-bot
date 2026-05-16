@@ -5,6 +5,8 @@
 # Prepares:
 #   .env                   from .env.example, if missing
 #   searxng/settings.yml   with a freshly-generated secret_key, if missing
+#   searxng/limiter.toml   passes the internal docker network through
+#                          botdetection so the bot can hit /search?format=json
 #
 # Then brings the stack up via `docker compose up -d --build`.
 #
@@ -99,7 +101,32 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Bring up the stack.
+# 3. searxng/limiter.toml — passes the internal docker network through
+#    botdetection so /search?format=json works without a reverse proxy
+#    setting X-Forwarded-For. Without this SearXNG returns 403 for our
+#    JSON tool calls.
+# ---------------------------------------------------------------------------
+if [ ! -f searxng/limiter.toml ]; then
+  cat > searxng/limiter.toml <<'EOF'
+[botdetection.ip_limit]
+filter_link_local = true
+link_token = false
+
+[botdetection.ip_lists]
+pass_searxng_org = false
+pass_ip = [
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "127.0.0.0/8",
+]
+block_ip = []
+EOF
+  echo "Generated searxng/limiter.toml."
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Bring up the stack.
 # ---------------------------------------------------------------------------
 if [ "$NO_UP" -eq 1 ]; then
   echo "Setup complete. Skipping 'docker compose up' (--no-up)."

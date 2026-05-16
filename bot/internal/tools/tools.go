@@ -459,6 +459,10 @@ func (r *Registry) searchWeb(ctx context.Context, query string) string {
 	q.Set("format", "json")
 	q.Set("safesearch", "1")
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, r.searxngURL+"/search?"+q.Encode(), nil)
+	// SearXNG's botdetection rejects requests with neither X-Forwarded-For
+	// nor X-Real-IP set. Our limiter.toml passes private ranges through, so
+	// claim a loopback IP to satisfy the check.
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
 	resp, err := r.http.Do(req)
 	if err != nil {
 		return fmt.Sprintf("Error: search request failed: %v", err)

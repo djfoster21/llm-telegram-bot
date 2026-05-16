@@ -1,0 +1,22 @@
+# SearXNG bot-detection / rate-limiter config.
+#
+# Without this file, SearXNG's botdetection module falls back to defaults
+# that reject JSON API requests over the internal docker network because
+# they have no X-Forwarded-For header. Since this instance is reachable
+# only from inside the compose network, we pass private IPv4 ranges
+# through and disable the link-token CSRF gate (it would block any client
+# that didn't first load the HTML page to grab a token).
+
+[botdetection.ip_limit]
+filter_link_local = true
+link_token = false
+
+[botdetection.ip_lists]
+pass_searxng_org = false
+pass_ip = [
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "127.0.0.0/8",
+]
+block_ip = []
