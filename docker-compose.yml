@@ -26,7 +26,7 @@ services:
         echo "Done."
 
   llama-server:
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda}
     depends_on:
       model-init:
         condition: service_completed_successfully

@@ -1,0 +1,17 @@
+# CPU-only override. Use when no NVIDIA GPU is available (or the CUDA
+# runtime isn't working). Swaps the llama.cpp image for the CPU build
+# and removes the nvidia device reservation that would otherwise fail
+# on hosts without nvidia-container-runtime.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build
+#
+# Also set LLAMA_NGL=0 in .env so llama-server doesn't try to offload
+# layers to a GPU that isn't there.
+#
+# Requires Docker Compose v2.24+ for the `!reset` tag.
+
+services:
+  llama-server:
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    deploy: !reset null

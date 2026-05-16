@@ -61,9 +61,46 @@ list; the most important variables are:
 | `ALLOWED_USER_IDS` | yes | Comma-separated Telegram user IDs allowed to DM the bot. Use `@userinfobot` to find yours. |
 | `ALLOWED_CHAT_IDS` | no | Group chat IDs where anyone can use the bot. Send `/status@<botname>` in the group to see its ID. |
 | `MODEL_URL` / `MODEL_FILE` | yes | GGUF model URL + filename. Defaults to Qwen 2.5 3B Instruct Q4 (~2 GB). |
+| `LLAMA_IMAGE` | no | llama.cpp server image. Defaults to the CUDA build. See [GPU vs CPU](#gpu-vs-cpu) below. |
 | `LLAMA_CTX` | no | Context window in tokens. Default 4096. |
 | `LLAMA_NGL` | no | GPU layers to offload. Default 24. Set to 0 for CPU-only. |
 | `HISTORY_TOKEN_BUDGET` | no | Cap on history tokens forwarded to the model per turn. Default 2500. |
+
+### GPU vs CPU
+
+The stack defaults to GPU (NVIDIA / CUDA). The `llama-server` service uses
+`ghcr.io/ggml-org/llama.cpp:server-cuda` and reserves an NVIDIA device via
+`deploy.resources` in `docker-compose.yml`.
+
+**To run on GPU (default)** you need:
+
+- An NVIDIA GPU with a recent driver on the host.
+- The [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+  installed and configured (`nvidia-ctk runtime configure --runtime=docker`
+  then `sudo systemctl restart docker`). Verify with
+  `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`.
+- `LLAMA_NGL` in `.env` set to as many layers as fit in VRAM (start low and
+  raise — too high causes a CUDA OOM at boot).
+
+**To run on CPU** (no GPU available, or the CUDA runtime is misbehaving),
+use the CPU override file:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build
+```
+
+The override swaps to the CPU image (`ghcr.io/ggml-org/llama.cpp:server`)
+and drops the nvidia device reservation that would otherwise refuse to
+start the container. Also set `LLAMA_NGL=0` in `.env` so llama-server
+doesn't try to offload layers it can't reach.
+
+CPU inference on a 7B Q3/Q4 model is usable but slow (~1 tok/s on a
+4-core laptop CPU). Drop to a 3B model if you need it snappier.
+
+For AMD GPUs use `LLAMA_IMAGE=ghcr.io/ggml-org/llama.cpp:server-rocm`;
+for Vulkan, `:server-vulkan`. Both still need the CPU override (or your
+own compose override) because the base file's nvidia reservation won't
+match.
 
 ### Per-user name overrides (optional)
 
@@ -108,6 +145,8 @@ The default model (Qwen 2.5 3B Q4) needs ~2 GB of VRAM if you want full
 GPU offload, or runs comfortably on CPU. For a 7B Q3/Q4 model on a 2 GB
 GPU, expect partial offload (~8 of 29 layers on GPU) and 2–3 tok/s. Raise
 `LLAMA_NGL` aggressively only if you have headroom.
+
+See [GPU vs CPU](#gpu-vs-cpu) for how to switch between the two.
 
 ## License
 
