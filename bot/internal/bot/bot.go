@@ -30,16 +30,20 @@ const (
 	editMaxAttempts  = 3    // streaming preview edits; failures fall back to a new message
 	editMaxRetryWait = 3 * time.Second
 	maxMsgLen        = 4000 // Telegram per-message ceiling is 4096 chars
+	// On exceed_context_size_error, the live history is wiped and the user's
+	// message re-fed up to this many times. After that we give up, discard the
+	// message, and post contextOverflowGiveUpMsg.
+	maxContextOverflowRetries = 2
 
 	// Fixed string sentinels.
 	autoSummaryMarker = "[CONTEXTO ANTERIOR]"
 	// User-facing error string. Internal errors are logged but never surfaced
 	// because they can leak hostnames, paths, or upstream tokens.
 	genericErrorMsg = "Uy, se me colgó algo. Probá de nuevo."
-	// Shown when llama-server reports the prompt exceeds its context window.
-	// /reset wipes live history but preserves the FTS5 long-term memory, so
-	// recall() still works on older turns.
-	contextOverflowMsg = "Che, este chat se me hizo demasiado largo para procesar (pasé el límite del modelo). Mandá /reset para arrancar la conversación de cero — la memoria a largo plazo queda guardada igual, podés preguntarme por cosas viejas."
+	// Shown after the retry loop above gives up. The live history is cleared
+	// and the offending message is discarded; FTS5 long-term memory is
+	// preserved, so recall() still works on older turns.
+	contextOverflowGiveUpMsg = "Che, no me entró en la cabeza ni reseteando. Tiré tu mensaje y limpié la memoria del chat. Probá mandarlo más corto o partido en dos — la memoria a largo plazo queda guardada igual."
 
 	helpText = `Bot conversacional con persona rioplatense. Estas son las cosas que puedo hacer:
 
@@ -726,6 +730,13 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	if err != nil {
 		return fmt.Errorf("load history: %w", err)
 	}
+	// Capture the just-archived user message so we can re-feed it after a
+	// context-overflow auto-reset.
+	var lastUserMsg *store.Message
+	if n := len(history); n > 0 && history[n-1].Role == "user" {
+		m := history[n-1]
+		lastUserMsg = &m
+	}
 	history = trimHistoryByTokens(history, b.cfg.HistoryTokenBudget)
 	llmMsgs := buildLLMMessages(b.systemPromptForChat(msg.Chat.ID), history)
 
@@ -742,11 +753,31 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	defer s.Close()
 
 	turnCtx := tools.WithChat(ctx, msg.Chat.ID, msg.From.ID)
-	final, err := b.runTurn(turnCtx, msg.Chat.ID, llmMsgs, s)
-	if err != nil {
-		log.Printf("runTurn: chat=%d err=%v", msg.Chat.ID, err)
-		s.replace(errorReply(err))
-		return nil
+
+	var final string
+	overflowFailures := 0
+	for {
+		var runErr error
+		final, runErr = b.runTurn(turnCtx, msg.Chat.ID, llmMsgs, s)
+		if runErr == nil {
+			break
+		}
+		if !isContextOverflow(runErr) {
+			log.Printf("runTurn: chat=%d err=%v", msg.Chat.ID, runErr)
+			s.replace(genericErrorMsg)
+			return nil
+		}
+		overflowFailures++
+		log.Printf("context overflow: chat=%d failure=%d, resetting live history", msg.Chat.ID, overflowFailures)
+		_ = b.store.Clear(msg.Chat.ID)
+		if overflowFailures > maxContextOverflowRetries || lastUserMsg == nil {
+			s.replace(contextOverflowGiveUpMsg)
+			return nil
+		}
+		// Re-feed the user message into the freshly-cleared live history and retry.
+		b.appendMessage(msg.Chat.ID, *lastUserMsg)
+		llmMsgs = buildLLMMessages(b.systemPromptForChat(msg.Chat.ID), []store.Message{*lastUserMsg})
+		s.reset()
 	}
 	if strings.TrimSpace(final) == "" {
 		final = "(respuesta vacía)"
@@ -759,19 +790,15 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	return nil
 }
 
-// errorReply picks a user-facing message for a failed inference. Specific
-// errors get specific text; everything else falls back to genericErrorMsg so
-// internal details (hostnames, paths, tokens) never reach the chat.
-func errorReply(err error) string {
+// isContextOverflow reports whether err is llama-server's
+// exceed_context_size_error (returned when the prompt is larger than -c).
+func isContextOverflow(err error) bool {
 	if err == nil {
-		return genericErrorMsg
+		return false
 	}
 	msg := err.Error()
-	if strings.Contains(msg, "exceed_context_size_error") ||
-		strings.Contains(msg, "exceeds the available context size") {
-		return contextOverflowMsg
-	}
-	return genericErrorMsg
+	return strings.Contains(msg, "exceed_context_size_error") ||
+		strings.Contains(msg, "exceeds the available context size")
 }
 
 // warnIfContextLarge logs whenever a prompt approaches the 4096-token cap
