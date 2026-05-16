@@ -234,23 +234,28 @@ func (r *Registry) Definitions() []llm.Tool {
 			Type: "function",
 			Function: llm.ToolDefinition{
 				Name: "set_reminder",
-				Description: "Schedule a reminder message to be posted in THIS chat at a specific time. " +
+				Description: "Schedule a reminder message to be posted in THIS chat. " +
 					"Use whenever the user asks you to remind them of something. " +
-					"The bot will send the reminder text at the chosen time, mentioning the user who set it. " +
-					"Examples: \"recordame el viernes a las 8pm de comprar vino\", \"avisame en 1 hora\".",
+					"PREFER 'in_seconds' for relative requests — the server adds it to the current time. " +
+					"Examples: \"avisame en 5 minutos\" → in_seconds=300, \"en 1 hora\" → 3600, \"en 2 días\" → 172800. " +
+					"Only use 'at_iso' when the user gave an explicit absolute date+time you can encode in RFC3339.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"fire_at": map[string]any{
+						"in_seconds": map[string]any{
+							"type":        "integer",
+							"description": "Seconds from now until the reminder fires. Use this for any \"in X minutes/hours/days\" request. Minimum 1.",
+						},
+						"at_iso": map[string]any{
 							"type":        "string",
-							"description": "RFC3339 timestamp WITH timezone offset, e.g. \"2026-05-22T20:00:00-03:00\". Must be in the future. Argentina is UTC-3.",
+							"description": "Absolute RFC3339 timestamp WITH timezone, e.g. \"2026-05-22T20:00:00-03:00\". Argentina is UTC-3. Only use when the user names a specific date; otherwise use in_seconds.",
 						},
 						"text": map[string]any{
 							"type":        "string",
-							"description": "What to remind the user about. Short, in the user's language. Example: \"comprar vino para la cena\".",
+							"description": "What to remind the user about. Short, in the user's language.",
 						},
 					},
-					"required": []string{"fire_at", "text"},
+					"required": []string{"text"},
 				},
 			},
 		},
@@ -333,13 +338,14 @@ func (r *Registry) Execute(ctx context.Context, call llm.ToolCall) string {
 		return r.recall(ctx, a.Query)
 	case "set_reminder":
 		var a struct {
-			FireAt string `json:"fire_at"`
-			Text   string `json:"text"`
+			InSeconds int    `json:"in_seconds"`
+			AtISO     string `json:"at_iso"`
+			Text      string `json:"text"`
 		}
-		if !parseArgs(raw, &a, &a.FireAt, &a.Text) {
-			return `Error: invalid arguments. Expected {"fire_at": "RFC3339", "text": "..."}.`
+		if !parseArgs(raw, &a, &a.Text) {
+			return `Error: invalid arguments. Expected {"in_seconds": N, "text": "..."} or {"at_iso": "RFC3339", "text": "..."}.`
 		}
-		return r.setReminder(ctx, a.FireAt, a.Text)
+		return r.setReminder(ctx, a.InSeconds, a.AtISO, a.Text)
 	default:
 		return "Error: unknown tool " + call.Function.Name
 	}
@@ -376,7 +382,7 @@ func (r *Registry) recall(ctx context.Context, query string) string {
 	return strings.TrimSpace(b.String())
 }
 
-func (r *Registry) setReminder(ctx context.Context, fireAtRaw, text string) string {
+func (r *Registry) setReminder(ctx context.Context, inSeconds int, atISO, text string) string {
 	if r.store == nil {
 		return "Error: recordatorios no disponibles."
 	}
@@ -385,13 +391,25 @@ func (r *Registry) setReminder(ctx context.Context, fireAtRaw, text string) stri
 		return "Error: contexto de chat no disponible."
 	}
 	userID, _ := userIDFromContext(ctx)
-	fireAt, err := time.Parse(time.RFC3339, fireAtRaw)
-	if err != nil {
-		return "Error: fire_at debe ser RFC3339 con zona horaria (ej. 2026-05-22T20:00:00-03:00)."
+
+	now := time.Now()
+	var fireAt time.Time
+	switch {
+	case inSeconds > 0:
+		fireAt = now.Add(time.Duration(inSeconds) * time.Second)
+	case atISO != "":
+		parsed, err := time.Parse(time.RFC3339, atISO)
+		if err != nil {
+			return "Error: at_iso debe ser RFC3339 con zona horaria (ej. 2026-05-22T20:00:00-03:00)."
+		}
+		fireAt = parsed
+	default:
+		return "Error: necesito in_seconds (preferido) o at_iso. Para \"en 5 minutos\" usá in_seconds=300."
 	}
-	if !fireAt.After(time.Now()) {
-		return "Error: fire_at tiene que ser en el futuro."
+	if !fireAt.After(now) {
+		return "Error: el momento del recordatorio tiene que ser en el futuro."
 	}
+
 	id, err := r.store.CreateReminder(chatID, userID, fireAt, text)
 	if err != nil {
 		return "Error: " + err.Error()
