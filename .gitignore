@@ -7,3 +7,6 @@ data-api/data-api
 config/user-names.json
 .claude/
 searxng/settings.yml
+.llama-server.pid
+llama-server.log
+.serena/

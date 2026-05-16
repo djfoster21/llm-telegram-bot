@@ -102,6 +102,39 @@ for Vulkan, `:server-vulkan`. Both still need the CPU override (or your
 own compose override) because the base file's nvidia reservation won't
 match.
 
+### macOS (Metal)
+
+Docker Desktop on Mac can't pass the Apple GPU through to containers, so
+there are two paths:
+
+- **All in Docker, CPU only.** Works on Intel and Apple Silicon. Use the
+  CPU override above and set `LLAMA_NGL=0`. Expect ~1–3 tok/s on a 7B
+  Q3/Q4 model.
+- **llama-server native, rest in Docker.** Fast on Apple Silicon — Metal
+  offload runs at full speed on the host while SearXNG, data-api, and
+  the bot stay containerized. The easy path is `mac_start_server.sh`:
+
+  ```sh
+  brew install llama.cpp
+  ./mac_start_server.sh
+  ```
+
+  The script sources `.env` for `MODEL_URL` / `MODEL_FILE` (so the bot's
+  `/status` and the actual loaded model stay in sync), downloads the
+  GGUF if missing, starts `llama-server` in the background with full
+  Metal offload, waits for it to load, and brings up the rest of the
+  stack with `docker-compose.mac.yml`. To switch models, edit `.env` and
+  re-run the script. See the comments at the top of `mac_start_server.sh`
+  for tested options on Apple Silicon (Qwen 2.5 14B, Qwen 3 30B-A3B
+  MoE, etc).
+
+  Stop everything:
+
+  ```sh
+  docker compose -f docker-compose.yml -f docker-compose.mac.yml down
+  kill "$(cat .llama-server.pid)" && rm .llama-server.pid
+  ```
+
 ### Per-user name overrides (optional)
 
 Create `config/user-names.json` to override how the bot refers to people:

@@ -1,0 +1,34 @@
+# macOS override. Docker Desktop on Mac can't pass the Apple GPU through
+# to containers, so for usable speed on Apple Silicon we run llama-server
+# natively on the host (with Metal) and the rest of the stack in Docker,
+# pointing the bot at host.docker.internal:8080.
+#
+# Usage:
+#   1) Run llama-server natively, e.g.:
+#        brew install llama.cpp
+#        llama-server -m ./models/<your-model>.gguf \
+#          --host 127.0.0.1 --port 8080 -c 4096 --jinja -fa on \
+#          --n-gpu-layers 999
+#   2) docker compose -f docker-compose.yml -f docker-compose.mac.yml up -d --build
+#
+# model-init and llama-server are parked under a non-default profile so
+# they don't start. The bot's depends_on is replaced (it only needs the
+# in-Docker services now) and LLAMA_BASE_URL is repointed at the host.
+#
+# Requires Docker Compose v2.24+ for the `!override` tag.
+
+services:
+  model-init:
+    profiles: ["disabled"]
+
+  llama-server:
+    profiles: ["disabled"]
+
+  bot:
+    depends_on: !override
+      searxng:
+        condition: service_started
+      data-api:
+        condition: service_started
+    environment:
+      LLAMA_BASE_URL: http://host.docker.internal:8080
