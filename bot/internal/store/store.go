@@ -41,7 +41,13 @@ type Store struct {
 }
 
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// WAL lets readers (the reminder poll loop) run alongside writers (message
+	// archival, FTS5 indexing, summary saves) without blocking each other.
+	// Without it, every Load/DueReminders racing an active write returns
+	// SQLITE_BUSY, so reminders silently never fire under chat activity.
+	// busy_timeout makes contending writers wait up to 5s instead of failing.
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
