@@ -36,6 +36,10 @@ const (
 	// User-facing error string. Internal errors are logged but never surfaced
 	// because they can leak hostnames, paths, or upstream tokens.
 	genericErrorMsg = "Uy, se me colgó algo. Probá de nuevo."
+	// Shown when llama-server reports the prompt exceeds its context window.
+	// /reset wipes live history but preserves the FTS5 long-term memory, so
+	// recall() still works on older turns.
+	contextOverflowMsg = "Che, este chat se me hizo demasiado largo para procesar (pasé el límite del modelo). Mandá /reset para arrancar la conversación de cero — la memoria a largo plazo queda guardada igual, podés preguntarme por cosas viejas."
 
 	helpText = `Bot conversacional con persona rioplatense. Estas son las cosas que puedo hacer:
 
@@ -741,7 +745,7 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	final, err := b.runTurn(turnCtx, msg.Chat.ID, llmMsgs, s)
 	if err != nil {
 		log.Printf("runTurn: chat=%d err=%v", msg.Chat.ID, err)
-		s.replace(genericErrorMsg)
+		s.replace(errorReply(err))
 		return nil
 	}
 	if strings.TrimSpace(final) == "" {
@@ -753,6 +757,21 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 
 	b.appendMessage(msg.Chat.ID, store.Message{Role: "assistant", Content: final})
 	return nil
+}
+
+// errorReply picks a user-facing message for a failed inference. Specific
+// errors get specific text; everything else falls back to genericErrorMsg so
+// internal details (hostnames, paths, tokens) never reach the chat.
+func errorReply(err error) string {
+	if err == nil {
+		return genericErrorMsg
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "exceed_context_size_error") ||
+		strings.Contains(msg, "exceeds the available context size") {
+		return contextOverflowMsg
+	}
+	return genericErrorMsg
 }
 
 // warnIfContextLarge logs whenever a prompt approaches the 4096-token cap
