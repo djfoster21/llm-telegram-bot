@@ -79,9 +79,11 @@ tests alongside the code (`*_test.go`) and they'll be picked up by
 
 - **History.** Every non-command message in an allowed chat is archived
   to SQLite (`store.go`). Per turn, the bot trims the archived history
-  to fit `HISTORY_TOKEN_BUDGET` (defaults to 2500) before forwarding to
+  to fit `HISTORY_TOKEN_BUDGET` (defaults to 1200) before forwarding to
   the model. The oldest portion of very long chats is compressed into a
-  single `[CONTEXTO ANTERIOR]` summary message.
+  single `[CONTEXTO ANTERIOR]` summary message. Messages also get
+  indexed into an FTS5 table for the `recall` tool, so old context is
+  searchable even after it falls off the live history.
 - **Inflight lock.** Only one inference at a time per chat
   (`claimInflight`). A user message arriving while inference is running
   gets a polite "still thinking" reply; a background auto-summary in
@@ -97,10 +99,10 @@ tests alongside the code (`*_test.go`) and they'll be picked up by
 |---|---|
 | Change the bot's persona / language / style | `config/system-prompt.txt` |
 | Add a new tool the model can call | `bot/internal/tools/tools.go` (definition + execute branch) |
-| Tune sampling, max tokens | `bot/internal/llm/llm.go` |
-| Add an env var | `bot/internal/config/config.go` and `.env.example` |
-| Change auto-summary thresholds | constants at the top of `bot/internal/bot/bot.go` |
+| Tune sampling, intervals, thresholds, summary timings, reactions | `.env` (all tunables live there — see `.env.example` for docs) |
+| Add a new tunable | `bot/internal/config/config.go` (field + Load() read) plus `.env.example` |
 | Add a data source (weather/etc.) | `data-api/main.go` plus a tool in `tools.go` calling it |
+| Touch safety bounds (tool-call cap, edit retries, SSRF guard) | code constants in `bot.go` / `tools.go` — kept out of `.env` on purpose |
 
 ## Things to be careful about
 

@@ -50,15 +50,32 @@ type StreamHandler interface {
 	OnToolStart(name string)
 }
 
+// Client holds the connection to llama-server plus the sampling parameters
+// applied to every Chat call. Fields are populated from config; defaults are
+// Qwen's official sampling recipe.
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+
+	MaxTokens     int
+	Temperature   float64
+	TopP          float64
+	TopK          int
+	MinP          float64
+	RepeatPenalty float64
 }
 
 func New(baseURL string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		HTTP:    &http.Client{Timeout: 0}, // no overall timeout — streaming may run long
+		// Defaults match Qwen 2.5 / Qwen 3; main.go overrides from config.
+		MaxTokens:     800,
+		Temperature:   0.7,
+		TopP:          0.8,
+		TopK:          20,
+		MinP:          0.0,
+		RepeatPenalty: 1.0,
 	}
 }
 
@@ -127,12 +144,12 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 		Messages:      msgs,
 		Tools:         tools,
 		Stream:        true,
-		MaxTokens:     800, // ~3000 chars — fits comfortably under Telegram's 4096 limit
-		Temperature:   0.7, // Qwen 2.5 / Qwen 3 official recipe
-		TopP:          0.8, // Qwen 2.5 / Qwen 3 official recipe
-		TopK:          20,  // Qwen 2.5 / Qwen 3 official recipe
-		MinP:          0.0, // Qwen 3 explicit recommendation
-		RepeatPenalty: 1.0, // disable; defaults can suppress tool-call tokens
+		MaxTokens:     c.MaxTokens,
+		Temperature:   c.Temperature,
+		TopP:          c.TopP,
+		TopK:          c.TopK,
+		MinP:          c.MinP,
+		RepeatPenalty: c.RepeatPenalty,
 	})
 	if err != nil {
 		return "", nil, err

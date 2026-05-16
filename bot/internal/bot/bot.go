@@ -24,34 +24,15 @@ import (
 )
 
 const (
-	maxToolRounds  = 4
-	streamInterval = 2500 * time.Millisecond
-	// editMaxAttempts is for streaming previews — those are best-effort, so
-	// failing after a few retries is OK. The final replace() uses its own
-	// fallback (send a new message) so the user always sees the full reply.
-	editMaxAttempts = 3
-	// editMaxRetryWait caps per-attempt sleeps on 429 so editTo (called from
-	// the LLM scanner loop via OnText→flush) can't stall the stream.
-	editMaxRetryWait  = 3 * time.Second
-	maxMsgLen         = 4000
-	maxStoredMessages = 300
+	// Implementation safety bounds — not exposed as env vars. Changing these
+	// can break tool calling, streaming UX, or Telegram protocol limits.
+	maxToolRounds    = 4    // cap runaway tool-call loops
+	editMaxAttempts  = 3    // streaming preview edits; failures fall back to a new message
+	editMaxRetryWait = 3 * time.Second
+	maxMsgLen        = 4000 // Telegram per-message ceiling is 4096 chars
 
-	spontaneousMin = 1
-	spontaneousMax = 15
-
-	autoSummaryAtMessages = 60
-	autoSummaryKeepRecent = 30
-	autoSummaryMarker     = "[CONTEXTO ANTERIOR]"
-	autoSummaryCooldown   = 30 * time.Minute
-
-	reactionProbability = 0.4
-
-	// Warn the chat when the estimated prompt approaches llama-server's
-	// 4096-token context window. Set conservatively below the cap so we have
-	// time to react before llama-server silently truncates old turns.
-	contextWarnThreshold = 3500
-	contextWarnCooldown  = time.Hour
-
+	// Fixed string sentinels.
+	autoSummaryMarker = "[CONTEXTO ANTERIOR]"
 	// User-facing error string. Internal errors are logged but never surfaced
 	// because they can leak hostnames, paths, or upstream tokens.
 	genericErrorMsg = "Uy, se me colgó algo. Probá de nuevo."
@@ -197,8 +178,8 @@ func (b *Bot) appendMessage(chatID int64, m store.Message) {
 		return
 	}
 	msgs = append(msgs, m)
-	if len(msgs) > maxStoredMessages {
-		msgs = msgs[len(msgs)-maxStoredMessages:]
+	if cap := b.cfg.MaxStoredMessages; cap > 0 && len(msgs) > cap {
+		msgs = msgs[len(msgs)-cap:]
 	}
 	if err := b.store.Save(chatID, msgs); err != nil {
 		log.Printf("append save: %v", err)
@@ -214,21 +195,25 @@ func (b *Bot) tickSpontaneous(chatID int64) bool {
 	defer b.spontMu.Unlock()
 	st, ok := b.spontData[chatID]
 	if !ok {
-		st = &spontaneousState{threshold: randomThreshold()}
+		st = &spontaneousState{threshold: b.randomThreshold()}
 		b.spontData[chatID] = st
 	}
 	st.count++
 	log.Printf("spontaneous tick: chat=%d count=%d threshold=%d", chatID, st.count, st.threshold)
 	if st.count >= st.threshold {
 		st.count = 0
-		st.threshold = randomThreshold()
+		st.threshold = b.randomThreshold()
 		return true
 	}
 	return false
 }
 
-func randomThreshold() int {
-	return spontaneousMin + rand.Intn(spontaneousMax-spontaneousMin+1)
+func (b *Bot) randomThreshold() int {
+	span := b.cfg.SpontaneousMax - b.cfg.SpontaneousMin + 1
+	if span < 1 {
+		span = 1
+	}
+	return b.cfg.SpontaneousMin + rand.Intn(span)
 }
 
 func buildLLMMessages(systemPrompt string, history []store.Message) []llm.Message {
@@ -294,7 +279,7 @@ func (b *Bot) tryReact(ctx context.Context, msg *telego.Message) {
 		if !p.re.MatchString(msg.Text) {
 			continue
 		}
-		if rand.Float64() > reactionProbability {
+		if rand.Float64() > b.cfg.ReactionProbability {
 			return
 		}
 		err := b.tg.SetMessageReaction(ctx, &telego.SetMessageReactionParams{
@@ -360,7 +345,7 @@ func (b *Bot) onDemandSummary(ctx context.Context, chatID int64) {
 
 func (b *Bot) maybeAutoSummarize(chatID int64) {
 	n, err := b.store.Count(chatID)
-	if err != nil || n < autoSummaryAtMessages {
+	if err != nil || n < b.cfg.AutoSummaryAtMessages {
 		return
 	}
 	b.summarizingMu.Lock()
@@ -368,7 +353,7 @@ func (b *Bot) maybeAutoSummarize(chatID int64) {
 		b.summarizingMu.Unlock()
 		return
 	}
-	if last, ok := b.lastSummaryAt[chatID]; ok && time.Since(last) < autoSummaryCooldown {
+	if last, ok := b.lastSummaryAt[chatID]; ok && time.Since(last) < b.cfg.AutoSummaryCooldown {
 		b.summarizingMu.Unlock()
 		return
 	}
@@ -427,7 +412,7 @@ func (b *Bot) autoSummarize(chatID int64) {
 	lock.Lock()
 	msgs, err := b.store.Load(chatID)
 	lock.Unlock()
-	if err != nil || len(msgs) < autoSummaryAtMessages {
+	if err != nil || len(msgs) < b.cfg.AutoSummaryAtMessages {
 		return
 	}
 
@@ -438,11 +423,12 @@ func (b *Bot) autoSummarize(chatID int64) {
 		existingSummary = &s
 		msgs = msgs[1:]
 	}
-	if len(msgs) <= autoSummaryKeepRecent {
+	keepRecent := b.cfg.AutoSummaryKeepRecent
+	if len(msgs) <= keepRecent {
 		return
 	}
-	toCompress := msgs[:len(msgs)-autoSummaryKeepRecent]
-	keep := msgs[len(msgs)-autoSummaryKeepRecent:]
+	toCompress := msgs[:len(msgs)-keepRecent]
+	keep := msgs[len(msgs)-keepRecent:]
 
 	llmMsgs := []llm.Message{{Role: "system", Content: b.systemPromptForChat(chatID)}}
 	if existingSummary != nil {
@@ -748,7 +734,7 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	defer stopTyping()
 	go b.keepTyping(typingCtx, msg.Chat.ID)
 
-	s := newStreamer(ctx, b.tg, msg.Chat.ID, placeholder.MessageID)
+	s := newStreamer(ctx, b.tg, msg.Chat.ID, placeholder.MessageID, b.cfg.StreamInterval)
 	defer s.Close()
 
 	turnCtx := tools.WithChat(ctx, msg.Chat.ID, msg.From.ID)
@@ -774,15 +760,15 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 // so the user knows old context is at risk of being silently truncated.
 func (b *Bot) warnIfContextLarge(ctx context.Context, chatID int64, msgs []llm.Message) {
 	tokens := estimateLLMTokens(msgs)
-	if tokens < contextWarnThreshold {
+	if tokens < b.cfg.ContextWarnThreshold {
 		return
 	}
 	log.Printf("context warn: chat=%d est_tokens=%d threshold=%d (llama-server -c is 4096)",
-		chatID, tokens, contextWarnThreshold)
+		chatID, tokens, b.cfg.ContextWarnThreshold)
 
 	b.contextWarnMu.Lock()
 	last, ok := b.contextWarnAt[chatID]
-	if ok && time.Since(last) < contextWarnCooldown {
+	if ok && time.Since(last) < b.cfg.ContextWarnCooldown {
 		b.contextWarnMu.Unlock()
 		return
 	}
@@ -974,6 +960,8 @@ type streamer struct {
 	placeholderID int // status indicator — edited by renderStatus only
 	messageID     int // current text target; == placeholderID ⇒ next text chunk starts a new message
 
+	streamInterval time.Duration // minimum gap between text edits (rate-limit safety)
+
 	mu         sync.Mutex
 	state      streamerState
 	buf        strings.Builder
@@ -987,17 +975,18 @@ type streamer struct {
 	done chan struct{}
 }
 
-func newStreamer(ctx context.Context, tg *telego.Bot, chatID int64, messageID int) *streamer {
+func newStreamer(ctx context.Context, tg *telego.Bot, chatID int64, messageID int, streamInterval time.Duration) *streamer {
 	s := &streamer{
-		ctx:           ctx,
-		tg:            tg,
-		chatID:        chatID,
-		placeholderID: messageID,
-		messageID:     messageID,
-		state:         stateBusy,
-		phaseStart:    time.Now(),
-		lastFlush:     time.Now(),
-		done:          make(chan struct{}),
+		ctx:            ctx,
+		tg:             tg,
+		streamInterval: streamInterval,
+		chatID:         chatID,
+		placeholderID:  messageID,
+		messageID:      messageID,
+		state:          stateBusy,
+		phaseStart:     time.Now(),
+		lastFlush:      time.Now(),
+		done:           make(chan struct{}),
 	}
 	go s.tickLoop()
 	return s
@@ -1083,7 +1072,7 @@ func (s *streamer) OnText(delta string) {
 	}
 	s.state = stateText
 	s.buf.WriteString(delta)
-	due := time.Since(s.lastFlush) >= streamInterval
+	due := time.Since(s.lastFlush) >= s.streamInterval
 	s.mu.Unlock()
 	if due {
 		s.flush()

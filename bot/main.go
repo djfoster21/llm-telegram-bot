@@ -30,6 +30,12 @@ func main() {
 	defer db.Close()
 
 	llmClient := llm.New(cfg.LlamaBaseURL)
+	llmClient.MaxTokens = cfg.MaxResponseTokens
+	llmClient.Temperature = cfg.Temperature
+	llmClient.TopP = cfg.TopP
+	llmClient.TopK = cfg.TopK
+	llmClient.MinP = cfg.MinP
+	llmClient.RepeatPenalty = cfg.RepeatPenalty
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
