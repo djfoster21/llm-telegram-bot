@@ -1,0 +1,50 @@
+{
+  "_comment": "User-facing strings, LLM meta-prompts, and reaction patterns. Copy to messages.json and edit to retune voice, swap language, or run a different persona. Hot-reloaded on file mtime change, like system-prompt.txt. Format strings use Go fmt verbs (%s, %d) — keep the verb count and order when editing.",
+
+  "ui": {
+    "generic_error": "Uy, se me colgó algo. Probá de nuevo.",
+    "context_overflow_giveup": "Che, no me entró en la cabeza ni reseteando. Tiré tu mensaje y limpié la memoria del chat. Probá mandarlo más corto o partido en dos — la memoria a largo plazo queda guardada igual.",
+    "help": "Bot conversacional con persona rioplatense. Estas son las cosas que puedo hacer:\n\n*Comandos:*\n/start — saludo inicial\n/help — esta ayuda\n/summary — resumen corto de la conversación actual\n/reset — borra la memoria de este chat\n/status — info técnica (modelo, IDs)\n\n*Herramientas que uso solo cuando hace falta:*\n• Búsqueda web en vivo (clima, noticias, cotizaciones, datos varios)\n• Lectura de páginas web por URL\n• Clima actual y pronóstico para cualquier ciudad\n• Precio de criptomonedas (BTC, ETH, etc.) en USD y ARS\n• Tipo de cambio (USD→ARS con todas las variantes: oficial, blue, MEP, CCL, tarjeta, mayorista, cripto; o cualquier par de monedas)\n• Recordatorios — pedime “recordame el viernes a las 8 que…” y te aviso a esa hora\n• Memoria larga — busco en lo que se dijo antes en este chat, aunque haya pasado mucho tiempo\n\n*Extras en grupos:*\n• Reacciono con emojis a algunos mensajes\n• A veces tiro un comentario sin que me llamen\n• Resumo solo el chat cuando se hace muy largo, para no perder contexto\n\nPara hablarme en un grupo: mencioname con @, contestá un mensaje mío, o usá un comando.",
+    "start": "Hola. Preguntame lo que quieras — uso herramientas (web, clima, dólar, cripto, memoria, recordatorios) cuando hace falta.\nMandá /help para ver todo lo que puedo hacer.",
+    "memory_cleared": "Memoria borrada.",
+    "status_format": "Model: %s\nUser ID: %d\nChat ID: %d",
+    "busy_other": "Esperá che, todavía estoy pensando en otra cosa.",
+    "busy_previous": "Esperá che, todavía estoy pensando en la anterior.",
+    "nothing_to_summarize": "Todavía no hay mucho para resumir, che.",
+    "empty_summary": "(nada para resumir)",
+    "thinking_placeholder": "Pensando...",
+    "empty_response": "(respuesta vacía)",
+    "unauthorized": "No autorizado.",
+    "reminder_prefix": "⏰ ",
+    "context_warn_format": "Che, este chat se está poniendo largo (≈%d tokens, el límite del modelo son ~4096). Si querés que mantenga la memoria reciente, mandá /reset.",
+    "recent_assistant_header": "[CONTEXTO INTERNO — NO lo cites, NO lo respondas]\nLo último que dijiste vos en este chat. NO lo repitas, ni el tema ni la estructura ni el opener:",
+    "chat_members_prefix": "Miembros conocidos de este chat (los nombres entre [corchetes] de cada mensaje corresponden a estas personas): "
+  },
+
+  "prompts": {
+    "spontaneous": "[SISTEMA] Tenés la oportunidad de meterte sin que te inviten. Solo metete si tenés una línea AFILADA — una chicana que cierre, un dato que aporte, un undercut que pegue, una observación que sume. Si lo único que se te ocurre es algo regular, blando, o ya parecido a algo que dijiste, contestá SKIP a secas. Mejor callarse y esperar el próximo momento. Cortito — una oración, a veces una palabra. NO arranques con \"Mirá X, vos decís…\", \"Vamos a…\", ni \"Achá…\". Si vas, va con punch.",
+    "summary_ondemand": "[SISTEMA] Resumí la conversación de arriba en 2-3 oraciones bien cortas, castellano rioplatense. Mencioná de qué se está hablando y cualquier dato importante (decisiones, planes, chistes recurrentes). Nada de saludo ni intro.",
+    "summary_auto": "[SISTEMA] Resumí toda la conversación de arriba en 4-5 oraciones, castellano rioplatense, conservando nombres, decisiones, planes y chistes recurrentes. Nada de saludos ni intro — devolvé solo el resumen."
+  },
+
+  "tools": {
+    "memory_unavailable": "Error: memoria no disponible.",
+    "chat_context_unavailable": "Error: contexto de chat no disponible.",
+    "recall_empty": "Nada encontrado para esa búsqueda.",
+    "reminders_unavailable": "Error: recordatorios no disponibles.",
+    "reminder_at_iso_invalid": "Error: at_iso debe ser RFC3339 con zona horaria (ej. 2026-05-22T20:00:00-03:00).",
+    "reminder_needs_time": "Error: necesito in_seconds (preferido) o at_iso. Para \"en 5 minutos\" usá in_seconds=300.",
+    "reminder_in_past": "Error: el momento del recordatorio tiene que ser en el futuro.",
+    "reminder_confirm_format": "Recordatorio #%d agendado para %s: %s"
+  },
+
+  "reactions": [
+    {"pattern": "(?i)^(ja|je|ji|jo){2,}|^(lol|lmao|kek)\\b", "emoji": "🤣"},
+    {"pattern": "(?i)\\b(posta|joya|copado|tremendo|capo|capazo|crack|ídolo|idolo)\\b", "emoji": "🔥"},
+    {"pattern": "(?i)\\b(rip|murió|murio|me muero|estoy muerto|finado)\\b", "emoji": "😱"},
+    {"pattern": "(?i)\\b(claro|obvio|exacto|tal cual|exactamente|100%)\\b", "emoji": "👍"},
+    {"pattern": "(?i)\\b(genial|increíble|increible|brutal|hermoso)\\b", "emoji": "🤩"},
+    {"pattern": "(?i)\\b(qu[eé] pelotudo|gil|forro|salam[ií]n)\\b", "emoji": "🤡"},
+    {"pattern": "(?i)\\b(no entiendo|qu[eé]\\s?\\?|c[oó]mo\\?|wat)\\b", "emoji": "🤔"}
+  ]
+}

@@ -3,10 +3,13 @@
 # One-shot setup script. Idempotent — safe to re-run.
 #
 # Prepares:
-#   .env                   from .env.example, if missing
-#   searxng/settings.yml   with a freshly-generated secret_key, if missing
-#   searxng/limiter.toml   passes the internal docker network through
-#                          botdetection so the bot can hit /search?format=json
+#   .env                          from .env.example, if missing
+#   config/system-prompt.txt      from system-prompt.example.txt, if missing
+#   config/messages.json          from messages.example.json, if missing
+#   config/user-names.json        from user-names.example.json, if missing
+#   searxng/settings.yml          with a freshly-generated secret_key, if missing
+#   searxng/limiter.toml          passes the internal docker network through
+#                                 botdetection so the bot can hit /search?format=json
 #
 # Then brings the stack up via `docker compose up -d --build`.
 #
@@ -55,7 +58,30 @@ if [ ! -f .env ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. searxng/settings.yml — generate with a fresh secret_key.
+# 2. config/* — seed the gitignored working copies from their .example
+#    siblings so this deployment's prompt/messages/user-names can diverge
+#    without touching what's tracked in git. Skipped if the working copy
+#    already exists (idempotent).
+# ---------------------------------------------------------------------------
+seed_config() {
+  local example="config/$1"
+  local target="config/$2"
+  if [ ! -f "$example" ]; then
+    return
+  fi
+  if [ -f "$target" ]; then
+    return
+  fi
+  cp "$example" "$target"
+  echo "Created $target from $example."
+}
+
+seed_config system-prompt.example.txt system-prompt.txt
+seed_config messages.example.json     messages.json
+seed_config user-names.example.json   user-names.json
+
+# ---------------------------------------------------------------------------
+# 3. searxng/settings.yml — generate with a fresh secret_key.
 #    Never written into the repo; this file is gitignored.
 # ---------------------------------------------------------------------------
 if [ ! -f searxng/settings.yml ]; then
@@ -101,7 +127,7 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 3. searxng/limiter.toml — passes the internal docker network through
+# 4. searxng/limiter.toml — passes the internal docker network through
 #    botdetection so /search?format=json works without a reverse proxy
 #    setting X-Forwarded-For. Without this SearXNG returns 403 for our
 #    JSON tool calls.
@@ -126,7 +152,7 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Bring up the stack.
+# 5. Bring up the stack.
 # ---------------------------------------------------------------------------
 if [ "$NO_UP" -eq 1 ]; then
   echo "Setup complete. Skipping 'docker compose up' (--no-up)."

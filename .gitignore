@@ -5,6 +5,8 @@ data/
 bot/bot
 data-api/data-api
 config/user-names.json
+config/messages.json
+config/system-prompt.txt
 .claude/
 searxng/settings.yml
 .llama-server.pid

@@ -91,4 +91,5 @@ services:
       DATA_API_URL: http://data-api:8080
       DB_PATH: /data/bot.db
       SYSTEM_PROMPT_PATH: /config/system-prompt.txt
+      MESSAGES_PATH: /config/messages.json
     restart: unless-stopped

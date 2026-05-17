@@ -19,6 +19,7 @@ type Config struct {
 	DBPath           string
 	SystemPromptPath string
 	UserNamesPath    string
+	MessagesPath     string
 	ModelFile        string
 
 	HistoryTokenBudget int
@@ -53,6 +54,7 @@ func Load() (*Config, error) {
 		DBPath:           getenv("DB_PATH", "/data/bot.db"),
 		SystemPromptPath: getenv("SYSTEM_PROMPT_PATH", "/config/system-prompt.txt"),
 		UserNamesPath:    getenv("USER_NAMES_PATH", "/config/user-names.json"),
+		MessagesPath:     getenv("MESSAGES_PATH", "/config/messages.json"),
 		ModelFile:        os.Getenv("MODEL_FILE"),
 	}
 	if c.TelegramToken == "" {

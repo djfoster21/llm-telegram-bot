@@ -15,6 +15,7 @@ import (
 	readability "github.com/go-shiori/go-readability"
 
 	"llm-telegram-bot/internal/llm"
+	"llm-telegram-bot/internal/messages"
 	"llm-telegram-bot/internal/store"
 	"llm-telegram-bot/internal/textutil"
 )
@@ -55,15 +56,17 @@ type Registry struct {
 	searxngURL string
 	dataAPIURL string
 	store      *store.Store
+	msgs       *messages.Loader
 	http       *http.Client // for internal services (searxng, data-api)
 	fetch      *http.Client // for fetch_url: SSRF-guarded against non-public IPs
 }
 
-func New(searxngURL, dataAPIURL string, db *store.Store) *Registry {
+func New(searxngURL, dataAPIURL string, db *store.Store, msgs *messages.Loader) *Registry {
 	return &Registry{
 		searxngURL: strings.TrimRight(searxngURL, "/"),
 		dataAPIURL: strings.TrimRight(dataAPIURL, "/"),
 		store:      db,
+		msgs:       msgs,
 		http:       &http.Client{Timeout: 25 * time.Second},
 		fetch:      newFetchClient(),
 	}
@@ -352,19 +355,20 @@ func (r *Registry) Execute(ctx context.Context, call llm.ToolCall) string {
 }
 
 func (r *Registry) recall(ctx context.Context, query string) string {
+	m := r.msgs.Get()
 	if r.store == nil {
-		return "Error: memoria no disponible."
+		return m.Tools.MemoryUnavailable
 	}
 	chatID, ok := chatIDFromContext(ctx)
 	if !ok {
-		return "Error: contexto de chat no disponible."
+		return m.Tools.ChatContextUnavailable
 	}
 	hits, err := r.store.Search(chatID, query, 5)
 	if err != nil {
 		return "Error: " + err.Error()
 	}
 	if len(hits) == 0 {
-		return "Nada encontrado para esa búsqueda."
+		return m.Tools.RecallEmpty
 	}
 	loc, _ := time.LoadLocation("America/Argentina/Buenos_Aires")
 	if loc == nil {
@@ -383,12 +387,13 @@ func (r *Registry) recall(ctx context.Context, query string) string {
 }
 
 func (r *Registry) setReminder(ctx context.Context, inSeconds int, atISO, text string) string {
+	m := r.msgs.Get()
 	if r.store == nil {
-		return "Error: recordatorios no disponibles."
+		return m.Tools.RemindersUnavailable
 	}
 	chatID, ok := chatIDFromContext(ctx)
 	if !ok {
-		return "Error: contexto de chat no disponible."
+		return m.Tools.ChatContextUnavailable
 	}
 	userID, _ := userIDFromContext(ctx)
 
@@ -400,14 +405,14 @@ func (r *Registry) setReminder(ctx context.Context, inSeconds int, atISO, text s
 	case atISO != "":
 		parsed, err := time.Parse(time.RFC3339, atISO)
 		if err != nil {
-			return "Error: at_iso debe ser RFC3339 con zona horaria (ej. 2026-05-22T20:00:00-03:00)."
+			return m.Tools.ReminderAtISOInvalid
 		}
 		fireAt = parsed
 	default:
-		return "Error: necesito in_seconds (preferido) o at_iso. Para \"en 5 minutos\" usá in_seconds=300."
+		return m.Tools.ReminderNeedsTime
 	}
 	if !fireAt.After(now) {
-		return "Error: el momento del recordatorio tiene que ser en el futuro."
+		return m.Tools.ReminderInPast
 	}
 
 	id, err := r.store.CreateReminder(chatID, userID, fireAt, text)
@@ -418,7 +423,7 @@ func (r *Registry) setReminder(ctx context.Context, inSeconds int, atISO, text s
 	if loc == nil {
 		loc = time.UTC
 	}
-	return fmt.Sprintf("Recordatorio #%d agendado para %s: %s",
+	return fmt.Sprintf(m.Tools.ReminderConfirmFormat,
 		id, fireAt.In(loc).Format("2006-01-02 15:04 -0700"), text)
 }
 

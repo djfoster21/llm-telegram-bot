@@ -19,13 +19,15 @@ external LLM provider.
 │   └── internal/
 │       ├── bot/    bot.go     Telegram handling, streaming, history, summaries
 │       ├── config/ config.go  Env-driven config loader
-│       ├── llm/    llm.go     llama.cpp OpenAI-compatible client (streaming + tools)
-│       ├── store/  store.go   SQLite per-chat history store
-│       └── tools/  tools.go   Tool definitions + implementations (search/fetch/weather/crypto/fx)
+│       ├── llm/    llm.go      llama.cpp OpenAI-compatible client (streaming + tools)
+│       ├── messages/ messages.go Hot-reloaded loader for user-facing strings + reactions
+│       ├── store/  store.go    SQLite per-chat history store
+│       └── tools/  tools.go    Tool definitions + implementations (search/fetch/weather/crypto/fx)
 ├── data-api/                  Go module: HTTP service fronting external data sources
 │   └── main.go
 ├── config/
-│   ├── system-prompt.txt              System prompt (hot-reloaded)
+│   ├── system-prompt.example.txt      System prompt (copy to system-prompt.txt; hot-reloaded; loader falls back to .example if real is missing)
+│   ├── messages.example.json          User-facing strings + reactions (copy to messages.json; hot-reloaded; same .example fallback)
 │   └── user-names.example.json        Per-user display-name overrides (copy to user-names.json)
 ├── searxng/settings.yml       SearXNG configuration (internal-only)
 ├── docker-compose.yml         5 services: model-init, llama-server, searxng, data-api, bot
@@ -97,7 +99,8 @@ tests alongside the code (`*_test.go`) and they'll be picked up by
 
 | You want to… | Edit |
 |---|---|
-| Change the bot's persona / language / style | `config/system-prompt.txt` |
+| Change the bot's persona / language / style | `config/system-prompt.txt` (gitignored; copy from `system-prompt.example.txt`) |
+| Edit canned replies, error strings, summary/spontaneous meta-prompts, emoji reactions | `config/messages.json` (hot-reloaded; falls back to built-in English defaults if missing) |
 | Add a new tool the model can call | `bot/internal/tools/tools.go` (definition + execute branch) |
 | Tune sampling, intervals, thresholds, summary timings, reactions | `.env` (all tunables live there — see `.env.example` for docs) |
 | Add a new tunable | `bot/internal/config/config.go` (field + Load() read) plus `.env.example` |

@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"llm-telegram-bot/internal/config"
 	"llm-telegram-bot/internal/llm"
+	"llm-telegram-bot/internal/messages"
 	"llm-telegram-bot/internal/store"
 	"llm-telegram-bot/internal/textutil"
 	"llm-telegram-bot/internal/tools"
@@ -35,55 +37,11 @@ const (
 	// message, and post contextOverflowGiveUpMsg.
 	maxContextOverflowRetries = 2
 
-	// Fixed string sentinels.
+	// Fixed string sentinel that prefixes auto-summary blobs in stored history.
+	// Kept in code (not in messages.json) because save/load logic and trim
+	// logic both pattern-match it — changing the marker requires a migration.
 	autoSummaryMarker = "[CONTEXTO ANTERIOR]"
-	// User-facing error string. Internal errors are logged but never surfaced
-	// because they can leak hostnames, paths, or upstream tokens.
-	genericErrorMsg = "Uy, se me colgó algo. Probá de nuevo."
-	// Shown after the retry loop above gives up. The live history is cleared
-	// and the offending message is discarded; FTS5 long-term memory is
-	// preserved, so recall() still works on older turns.
-	contextOverflowGiveUpMsg = "Che, no me entró en la cabeza ni reseteando. Tiré tu mensaje y limpié la memoria del chat. Probá mandarlo más corto o partido en dos — la memoria a largo plazo queda guardada igual."
-
-	helpText = `Bot conversacional con persona rioplatense. Estas son las cosas que puedo hacer:
-
-*Comandos:*
-/start — saludo inicial
-/help — esta ayuda
-/summary — resumen corto de la conversación actual
-/reset — borra la memoria de este chat
-/status — info técnica (modelo, IDs)
-
-*Herramientas que uso solo cuando hace falta:*
-• Búsqueda web en vivo (clima, noticias, cotizaciones, datos varios)
-• Lectura de páginas web por URL
-• Clima actual y pronóstico para cualquier ciudad
-• Precio de criptomonedas (BTC, ETH, etc.) en USD y ARS
-• Tipo de cambio (USD→ARS con todas las variantes: oficial, blue, MEP, CCL, tarjeta, mayorista, cripto; o cualquier par de monedas)
-• Recordatorios — pedime “recordame el viernes a las 8 que…” y te aviso a esa hora
-• Memoria larga — busco en lo que se dijo antes en este chat, aunque haya pasado mucho tiempo
-
-*Extras en grupos:*
-• Reacciono con emojis a algunos mensajes
-• A veces tiro un comentario sin que me llamen
-• Resumo solo el chat cuando se hace muy largo, para no perder contexto
-
-Para hablarme en un grupo: mencioname con @, contestá un mensaje mío, o usá un comando.`
 )
-
-// Order matters — first match wins.
-var reactionPatterns = []struct {
-	re    *regexp.Regexp
-	emoji string
-}{
-	{regexp.MustCompile(`(?i)^(ja|je|ji|jo){2,}|^(lol|lmao|kek)\b`), "🤣"},
-	{regexp.MustCompile(`(?i)\b(posta|joya|copado|tremendo|capo|capazo|crack|ídolo|idolo)\b`), "🔥"},
-	{regexp.MustCompile(`(?i)\b(rip|murió|murio|me muero|estoy muerto|finado)\b`), "😱"},
-	{regexp.MustCompile(`(?i)\b(claro|obvio|exacto|tal cual|exactamente|100%)\b`), "👍"},
-	{regexp.MustCompile(`(?i)\b(genial|increíble|increible|brutal|hermoso)\b`), "🤩"},
-	{regexp.MustCompile(`(?i)\b(qu[eé] pelotudo|gil|forro|salam[ií]n)\b`), "🤡"},
-	{regexp.MustCompile(`(?i)\b(no entiendo|qu[eé]\s?\?|c[oó]mo\?|wat)\b`), "🤔"},
-}
 
 type Bot struct {
 	cfg      *config.Config
@@ -91,6 +49,7 @@ type Bot struct {
 	store    *store.Store
 	llm      *llm.Client
 	tools    *tools.Registry
+	msgs     *messages.Loader
 	username string
 
 	// rootCtx is set by Run; spawned goroutines use it so SIGTERM propagates.
@@ -129,7 +88,7 @@ type spontaneousState struct {
 	threshold int
 }
 
-func New(cfg *config.Config, db *store.Store, llmClient *llm.Client, registry *tools.Registry) (*Bot, error) {
+func New(cfg *config.Config, db *store.Store, llmClient *llm.Client, registry *tools.Registry, msgs *messages.Loader) (*Bot, error) {
 	tg, err := telego.NewBot(cfg.TelegramToken)
 	if err != nil {
 		return nil, err
@@ -144,6 +103,7 @@ func New(cfg *config.Config, db *store.Store, llmClient *llm.Client, registry *t
 		store:         db,
 		llm:           llmClient,
 		tools:         registry,
+		msgs:          msgs,
 		username:      me.Username,
 		inflight:      map[int64]bool{},
 		spontData:     map[int64]*spontaneousState{},
@@ -235,7 +195,7 @@ func buildLLMMessages(systemPrompt string, history []store.Message) []llm.Messag
 
 // recentAssistantBlock returns a system-role reminder of the bot's last N
 // assistant turns so it can avoid echoing them. Empty string if none.
-func recentAssistantBlock(history []store.Message, n int) string {
+func recentAssistantBlock(header string, history []store.Message, n int) string {
 	if n <= 0 {
 		return ""
 	}
@@ -260,9 +220,7 @@ func recentAssistantBlock(history []store.Message, n int) string {
 	for i, j := 0, len(picks)-1; i < j; i, j = i+1, j-1 {
 		picks[i], picks[j] = picks[j], picks[i]
 	}
-	return "[CONTEXTO INTERNO — NO lo cites, NO lo respondas]\n" +
-		"Lo último que dijiste vos en este chat. NO lo repitas, ni el tema ni la estructura ni el opener:\n" +
-		strings.Join(picks, "\n")
+	return header + "\n" + strings.Join(picks, "\n")
 }
 
 func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
@@ -280,17 +238,14 @@ func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
 		return
 	}
 
+	m := b.msgs.Get()
 	llmMsgs := buildLLMMessages(b.systemPromptForChat(chatID), history)
-	if recent := recentAssistantBlock(history, 3); recent != "" {
+	if recent := recentAssistantBlock(m.UI.RecentAssistantHeader, history, 3); recent != "" {
 		llmMsgs = append(llmMsgs, llm.Message{Role: "system", Content: recent})
 	}
 	llmMsgs = append(llmMsgs, llm.Message{
-		Role: "user",
-		Content: "[SISTEMA] Tenés la oportunidad de meterte sin que te inviten. " +
-			"Solo metete si tenés una línea AFILADA — una chicana que cierre, un dato que aporte, un undercut que pegue, una observación que sume. " +
-			"Si lo único que se te ocurre es algo regular, blando, o ya parecido a algo que dijiste, contestá SKIP a secas. Mejor callarse y esperar el próximo momento. " +
-			"Cortito — una oración, a veces una palabra. NO arranques con \"Mirá X, vos decís…\", \"Vamos a…\", ni \"Achá…\". " +
-			"Si vas, va con punch.",
+		Role:    "user",
+		Content: m.Prompts.Spontaneous,
 	})
 
 	log.Printf("spontaneous: chat=%d firing", chatID)
@@ -317,8 +272,8 @@ func (b *Bot) tryReact(ctx context.Context, msg *telego.Message) {
 	if msg == nil || msg.Text == "" {
 		return
 	}
-	for _, p := range reactionPatterns {
-		if !p.re.MatchString(msg.Text) {
+	for _, p := range b.msgs.Get().Reactions {
+		if p.RE == nil || !p.RE.MatchString(msg.Text) {
 			continue
 		}
 		if rand.Float64() > b.cfg.ReactionProbability {
@@ -328,23 +283,23 @@ func (b *Bot) tryReact(ctx context.Context, msg *telego.Message) {
 			ChatID:    tu.ID(msg.Chat.ID),
 			MessageID: msg.MessageID,
 			Reaction: []telego.ReactionType{
-				&telego.ReactionTypeEmoji{Type: "emoji", Emoji: p.emoji},
+				&telego.ReactionTypeEmoji{Type: "emoji", Emoji: p.Emoji},
 			},
 		})
 		if err != nil {
 			log.Printf("react: emoji=%s msg=%d text=%q err=%v",
-				p.emoji, msg.MessageID, textutil.Ellipsize(msg.Text, 60), err)
+				p.Emoji, msg.MessageID, textutil.Ellipsize(msg.Text, 60), err)
 			return
 		}
-		log.Printf("react: chat=%d msg=%d emoji=%s", msg.Chat.ID, msg.MessageID, p.emoji)
+		log.Printf("react: chat=%d msg=%d emoji=%s", msg.Chat.ID, msg.MessageID, p.Emoji)
 		return
 	}
 }
 
 func (b *Bot) onDemandSummary(ctx context.Context, chatID int64) {
+	m := b.msgs.Get()
 	if !b.claimInflight(chatID) {
-		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID),
-			"Esperá che, todavía estoy pensando en otra cosa."))
+		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), m.UI.BusyOther))
 		return
 	}
 	defer b.releaseInflight(chatID)
@@ -355,30 +310,27 @@ func (b *Bot) onDemandSummary(ctx context.Context, chatID int64) {
 		return
 	}
 	if len(history) < 3 {
-		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID),
-			"Todavía no hay mucho para resumir, che."))
+		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), m.UI.NothingToSummarize))
 		return
 	}
 	history = trimHistoryByTokens(history, b.cfg.HistoryTokenBudget)
 
 	llmMsgs := buildLLMMessages(b.systemPromptForChat(chatID), history)
 	llmMsgs = append(llmMsgs, llm.Message{
-		Role: "user",
-		Content: "[SISTEMA] Resumí la conversación de arriba en 2-3 oraciones bien cortas, " +
-			"castellano rioplatense. Mencioná de qué se está hablando y cualquier dato importante " +
-			"(decisiones, planes, chistes recurrentes). Nada de saludo ni intro.",
+		Role:    "user",
+		Content: m.Prompts.SummaryOnDemand,
 	})
 
 	log.Printf("summary: chat=%d generating", chatID)
 	final, _, err := b.llm.Chat(ctx, llmMsgs, nil, nil)
 	if err != nil {
 		log.Printf("summary: %v", err)
-		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), genericErrorMsg))
+		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), m.UI.GenericError))
 		return
 	}
 	final = strings.TrimSpace(final)
 	if final == "" {
-		final = "(nada para resumir)"
+		final = m.UI.EmptySummary
 	}
 	final = textutil.Ellipsize(final, maxMsgLen)
 	_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), final))
@@ -480,10 +432,8 @@ func (b *Bot) autoSummarize(chatID int64) {
 		llmMsgs = append(llmMsgs, llm.Message{Role: m.Role, Content: m.Content})
 	}
 	llmMsgs = append(llmMsgs, llm.Message{
-		Role: "user",
-		Content: "[SISTEMA] Resumí toda la conversación de arriba en 4-5 oraciones, " +
-			"castellano rioplatense, conservando nombres, decisiones, planes y chistes recurrentes. " +
-			"Nada de saludos ni intro — devolvé solo el resumen.",
+		Role:    "user",
+		Content: b.msgs.Get().Prompts.SummaryAuto,
 	})
 
 	log.Printf("auto-summary: chat=%d compressing %d msgs", chatID, len(toCompress))
@@ -599,7 +549,7 @@ func (b *Bot) reminderLoop(ctx context.Context) {
 			return
 		}
 		for _, r := range due {
-			msg := "⏰ " + r.Text
+			msg := b.msgs.Get().UI.ReminderPrefix + r.Text
 			if _, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(r.ChatID), msg)); err != nil {
 				log.Printf("reminder send: chat=%d id=%d err=%v", r.ChatID, r.ID, err)
 				// Leave it in the table so we try again next tick.
@@ -691,7 +641,7 @@ func (b *Bot) handle(ctx context.Context, msg *telego.Message) {
 	chatAllowed := isGroup && b.cfg.AllowedChatIDs[msg.Chat.ID]
 	if !userAllowed && !chatAllowed {
 		if addressed {
-			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "No autorizado."))
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), b.msgs.Get().UI.Unauthorized))
 			log.Printf("rejected user %d (%s) in chat %d", msg.From.ID, msg.From.Username, msg.Chat.ID)
 		}
 		return
@@ -718,24 +668,24 @@ func (b *Bot) handle(ctx context.Context, msg *telego.Message) {
 	if isCommand {
 		cmd, _, _ := strings.Cut(text, " ")
 		cmd, _, _ = strings.Cut(cmd, "@")
+		m := b.msgs.Get()
 		switch cmd {
 		case "/start":
-			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
-				"Hola. Preguntame lo que quieras — uso herramientas (web, clima, dólar, cripto, memoria, recordatorios) cuando hace falta.\nMandá /help para ver todo lo que puedo hacer."))
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), m.UI.Start))
 			return
 		case "/reset":
 			_ = b.store.Clear(msg.Chat.ID)
-			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "Memoria borrada."))
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), m.UI.MemoryCleared))
 			return
 		case "/status":
 			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
-				fmt.Sprintf("Model: %s\nUser ID: %d\nChat ID: %d", b.cfg.ModelFile, msg.From.ID, msg.Chat.ID)))
+				fmt.Sprintf(m.UI.StatusFormat, b.cfg.ModelFile, msg.From.ID, msg.Chat.ID)))
 			return
 		case "/summary":
 			go b.onDemandSummary(b.rootCtx, msg.Chat.ID)
 			return
 		case "/help":
-			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), helpText))
+			_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), m.UI.Help))
 			return
 		}
 		// Unknown slash command — fall through and let the model see it.
@@ -747,15 +697,15 @@ func (b *Bot) handle(ctx context.Context, msg *telego.Message) {
 
 	if err := b.respond(ctx, msg); err != nil {
 		log.Printf("respond: %v", err)
-		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), genericErrorMsg))
+		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), b.msgs.Get().UI.GenericError))
 	}
 }
 
 func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
+	m := b.msgs.Get()
 	if !b.claimInflight(msg.Chat.ID) {
 		log.Printf("skip: chat=%d already has an inference in flight", msg.Chat.ID)
-		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID),
-			"Esperá che, todavía estoy pensando en la anterior."))
+		_, _ = b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), m.UI.BusyPrevious))
 		return nil
 	}
 	defer b.releaseInflight(msg.Chat.ID)
@@ -768,13 +718,13 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	// context-overflow auto-reset.
 	var lastUserMsg *store.Message
 	if n := len(history); n > 0 && history[n-1].Role == "user" {
-		m := history[n-1]
-		lastUserMsg = &m
+		um := history[n-1]
+		lastUserMsg = &um
 	}
 	history = trimHistoryByTokens(history, b.cfg.HistoryTokenBudget)
 	llmMsgs := buildLLMMessages(b.systemPromptForChat(msg.Chat.ID), history)
 
-	placeholder, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), "Pensando..."))
+	placeholder, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(msg.Chat.ID), m.UI.ThinkingPlaceholder))
 	if err != nil {
 		return fmt.Errorf("send placeholder: %w", err)
 	}
@@ -798,14 +748,14 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 		}
 		if !isContextOverflow(runErr) {
 			log.Printf("runTurn: chat=%d err=%v", msg.Chat.ID, runErr)
-			s.replace(genericErrorMsg)
+			s.replace(m.UI.GenericError)
 			return nil
 		}
 		overflowFailures++
 		log.Printf("context overflow: chat=%d failure=%d, resetting live history", msg.Chat.ID, overflowFailures)
 		_ = b.store.Clear(msg.Chat.ID)
 		if overflowFailures > maxContextOverflowRetries || lastUserMsg == nil {
-			s.replace(contextOverflowGiveUpMsg)
+			s.replace(m.UI.ContextOverflowGiveUp)
 			return nil
 		}
 		// Re-feed the user message into the freshly-cleared live history and retry.
@@ -814,7 +764,7 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 		s.reset()
 	}
 	if strings.TrimSpace(final) == "" {
-		final = "(respuesta vacía)"
+		final = m.UI.EmptyResponse
 	}
 	final = textutil.Ellipsize(final, maxMsgLen)
 	log.Printf("reply: chat=%d text=%q", msg.Chat.ID, textutil.Ellipsize(final, 200))
@@ -855,11 +805,7 @@ func (b *Bot) warnIfContextLarge(ctx context.Context, chatID int64, msgs []llm.M
 	b.contextWarnAt[chatID] = time.Now()
 	b.contextWarnMu.Unlock()
 
-	msg := fmt.Sprintf(
-		"Che, este chat se está poniendo largo (≈%d tokens, el límite del modelo son ~4096). "+
-			"Si querés que mantenga la memoria reciente, mandá /reset.",
-		tokens,
-	)
+	msg := fmt.Sprintf(b.msgs.Get().UI.ContextWarnFormat, tokens)
 	if _, err := b.tg.SendMessage(ctx, tu.Message(tu.ID(chatID), msg)); err != nil {
 		log.Printf("context warn send: %v", err)
 	}
@@ -953,14 +899,18 @@ func (b *Bot) systemPromptForChat(chatID int64) string {
 	if len(names) == 0 {
 		return prompt
 	}
-	return prompt + "\n\nMiembros conocidos de este chat (los nombres entre [corchetes] de cada mensaje corresponden a estas personas): " +
-		strings.Join(names, ", ") + "."
+	return prompt + "\n\n" + b.msgs.Get().UI.ChatMembersPrefix + strings.Join(names, ", ") + "."
 }
 
 // cachedSystemPrompt returns the system-prompt file content, re-reading only
-// when the file's mtime changes. Avoids per-turn disk I/O.
+// when the file's mtime changes. Falls back to the sibling .example.txt so a
+// fresh clone runs without the user having to copy the file first.
 func (b *Bot) cachedSystemPrompt() string {
-	info, err := os.Stat(b.cfg.SystemPromptPath)
+	path := resolveConfigPath(b.cfg.SystemPromptPath, ".example.txt")
+	if path == "" {
+		return "You are a helpful assistant."
+	}
+	info, err := os.Stat(path)
 	if err != nil {
 		return "You are a helpful assistant."
 	}
@@ -973,7 +923,7 @@ func (b *Bot) cachedSystemPrompt() string {
 	}
 	b.promptMu.RUnlock()
 
-	raw, err := os.ReadFile(b.cfg.SystemPromptPath)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "You are a helpful assistant."
 	}
@@ -983,6 +933,29 @@ func (b *Bot) cachedSystemPrompt() string {
 	b.promptMtime = mtime
 	b.promptMu.Unlock()
 	return s
+}
+
+// resolveConfigPath returns p if it exists; otherwise returns the
+// example-sibling path (basename without trailing ext + exampleSuffix) in the
+// same directory, if THAT exists. Returns "" if neither exists.
+//
+// Example: ("/config/system-prompt.txt", ".example.txt") →
+//   "/config/system-prompt.txt"           if it exists
+//   "/config/system-prompt.example.txt"   otherwise, if THAT exists
+//   ""                                    otherwise
+func resolveConfigPath(p, exampleSuffix string) string {
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	dir := filepath.Dir(p)
+	base := filepath.Base(p)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	candidate := filepath.Join(dir, stem+exampleSuffix)
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	return ""
 }
 
 var busyGerunds = []string{

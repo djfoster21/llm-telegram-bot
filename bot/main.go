@@ -11,6 +11,7 @@ import (
 	"llm-telegram-bot/internal/bot"
 	"llm-telegram-bot/internal/config"
 	"llm-telegram-bot/internal/llm"
+	"llm-telegram-bot/internal/messages"
 	"llm-telegram-bot/internal/store"
 	"llm-telegram-bot/internal/tools"
 )
@@ -46,9 +47,13 @@ func main() {
 	}
 	log.Println("llama-server ready")
 
-	registry := tools.New(cfg.SearxngURL, cfg.DataAPIURL, db)
+	msgs := messages.NewLoader(cfg.MessagesPath)
+	// Prime the cache (and surface load errors early).
+	_ = msgs.Get()
 
-	b, err := bot.New(cfg, db, llmClient, registry)
+	registry := tools.New(cfg.SearxngURL, cfg.DataAPIURL, db, msgs)
+
+	b, err := bot.New(cfg, db, llmClient, registry, msgs)
 	if err != nil {
 		log.Fatalf("bot: %v", err)
 	}
