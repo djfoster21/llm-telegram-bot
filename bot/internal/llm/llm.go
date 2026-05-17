@@ -174,6 +174,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 
 	var content strings.Builder
 	calls := map[int]*ToolCall{}
+	var stripper thinkStripper
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
@@ -195,9 +196,12 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 		}
 		ch := chunk.Choices[0]
 		if ch.Delta.Content != "" {
-			content.WriteString(ch.Delta.Content)
-			if h != nil {
-				h.OnText(ch.Delta.Content)
+			visible := stripper.feed(ch.Delta.Content)
+			if visible != "" {
+				content.WriteString(visible)
+				if h != nil {
+					h.OnText(visible)
+				}
 			}
 		}
 		for _, tc := range ch.Delta.ToolCalls {
@@ -226,6 +230,12 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 	if err := scanner.Err(); err != nil {
 		return "", nil, err
 	}
+	if tail := stripper.flush(); tail != "" {
+		content.WriteString(tail)
+		if h != nil {
+			h.OnText(tail)
+		}
+	}
 
 	indices := make([]int, 0, len(calls))
 	for i := range calls {
@@ -237,4 +247,75 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 		ordered = append(ordered, *calls[i])
 	}
 	return content.String(), ordered, nil
+}
+
+// thinkStripper removes <think>...</think> reasoning blocks from a streamed
+// token sequence emitted by reasoning models (Qwen3-Thinking, QwQ, R1-distills).
+// Tag boundaries can fall inside a chunk, so partial prefix matches at the tail
+// are buffered until the next chunk resolves them.
+type thinkStripper struct {
+	inside  bool
+	pending string
+}
+
+const (
+	thinkOpen  = "<think>"
+	thinkClose = "</think>"
+)
+
+func (t *thinkStripper) feed(delta string) string {
+	var out strings.Builder
+	s := t.pending + delta
+	t.pending = ""
+	for len(s) > 0 {
+		if t.inside {
+			i := strings.Index(s, thinkClose)
+			if i < 0 {
+				t.pending = tailPrefix(s, thinkClose)
+				break
+			}
+			s = s[i+len(thinkClose):]
+			t.inside = false
+			continue
+		}
+		i := strings.Index(s, thinkOpen)
+		if i < 0 {
+			p := tailPrefix(s, thinkOpen)
+			out.WriteString(s[:len(s)-len(p)])
+			t.pending = p
+			break
+		}
+		out.WriteString(s[:i])
+		s = s[i+len(thinkOpen):]
+		t.inside = true
+	}
+	return out.String()
+}
+
+// flush returns any residue at end-of-stream. If still inside a think block
+// (no closing tag arrived — truncation), the residue is dropped. Otherwise
+// a pending prefix that never resolved into an open tag is emitted as text.
+func (t *thinkStripper) flush() string {
+	if t.inside {
+		t.pending = ""
+		return ""
+	}
+	out := t.pending
+	t.pending = ""
+	return out
+}
+
+// tailPrefix returns the longest suffix of s that is a proper prefix of tag.
+// Used to detect a split tag straddling a chunk boundary.
+func tailPrefix(s, tag string) string {
+	n := len(tag) - 1
+	if n > len(s) {
+		n = len(s)
+	}
+	for ; n > 0; n-- {
+		if strings.HasPrefix(tag, s[len(s)-n:]) {
+			return s[len(s)-n:]
+		}
+	}
+	return ""
 }
