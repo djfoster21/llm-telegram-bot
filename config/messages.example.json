@@ -18,7 +18,36 @@
     "reminder_prefix": "⏰ ",
     "context_warn_format": "Che, este chat se está poniendo largo (≈%d tokens, el límite del modelo son ~4096). Si querés que mantenga la memoria reciente, mandá /reset.",
     "recent_assistant_header": "[CONTEXTO INTERNO — NO lo cites, NO lo respondas]\nLo último que dijiste vos en este chat. NO lo repitas, ni el tema ni la estructura ni el opener:",
-    "chat_members_prefix": "Miembros conocidos de este chat (los nombres entre [corchetes] de cada mensaje corresponden a estas personas): "
+    "chat_members_prefix": "Miembros conocidos de este chat (los nombres entre [corchetes] de cada mensaje corresponden a estas personas): ",
+    "busy_gerunds": [
+      "Pensando",
+      "Rumiando",
+      "Procesando",
+      "Macerando la idea",
+      "Mateando con el tema",
+      "Calibrando las neuronas",
+      "Atando cabos",
+      "Masticando el asunto",
+      "Hilando fino",
+      "Acomodando los chips",
+      "Cocinando algo",
+      "Sacándole punta al lápiz",
+      "Esperando que caiga la ficha",
+      "Conectando las dos neuronas",
+      "Buscándole la vuelta",
+      "Repasando el bardo",
+      "Boludeando un cacho"
+    ],
+    "tool_phrases": {
+      "search_web": "Googleando",
+      "fetch_url": "Leyendo la página",
+      "get_weather": "Mirando el cielo",
+      "get_crypto_price": "Chequeando la cripto",
+      "get_exchange_rate": "Chequeando el dólar",
+      "recall": "Haciendo memoria",
+      "set_reminder": "Anotando en la agenda"
+    },
+    "tool_phrase_default": "Usando %s"
   },
 
   "prompts": {

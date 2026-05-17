@@ -733,7 +733,7 @@ func (b *Bot) respond(ctx context.Context, msg *telego.Message) error {
 	defer stopTyping()
 	go b.keepTyping(typingCtx, msg.Chat.ID)
 
-	s := newStreamer(ctx, b.tg, msg.Chat.ID, placeholder.MessageID, b.cfg.StreamInterval)
+	s := newStreamer(ctx, b.tg, b.msgs, msg.Chat.ID, placeholder.MessageID, b.cfg.StreamInterval)
 	defer s.Close()
 
 	turnCtx := tools.WithChat(ctx, msg.Chat.ID, msg.From.ID)
@@ -958,39 +958,25 @@ func resolveConfigPath(p, exampleSuffix string) string {
 	return ""
 }
 
-var busyGerunds = []string{
-	"Thinking",
-	"Cogitating",
-	"Pondering",
-	"Ruminating",
-	"Marinating",
-	"Percolating",
-	"Synthesizing",
-	"Calibrating",
-	"Confabulating",
-	"Wrangling thoughts",
-	"Noodling",
-	"Crystallizing",
-	"Mulling it over",
-	"Sharpening pencils",
-	"Consulting the oracle",
-}
-
-func gerundFor(phaseStart time.Time) string {
+func (s *streamer) gerundFor(phaseStart time.Time) string {
+	gs := s.msgs.Get().UI.BusyGerunds
+	if len(gs) == 0 {
+		return "Thinking"
+	}
 	// Change roughly every 4 seconds within a phase, deterministically.
 	idx := int(time.Since(phaseStart).Seconds()) / 4
-	return busyGerunds[idx%len(busyGerunds)]
+	return gs[idx%len(gs)]
 }
 
-func toolPhrase(name string) string {
-	switch name {
-	case "search_web":
-		return "Searching the web"
-	case "fetch_url":
-		return "Reading the page"
-	default:
-		return "Running " + name
+func (s *streamer) toolPhrase(name string) string {
+	ui := s.msgs.Get().UI
+	if p, ok := ui.ToolPhrases[name]; ok && p != "" {
+		return p
 	}
+	if strings.Contains(ui.ToolPhraseDefault, "%s") {
+		return fmt.Sprintf(ui.ToolPhraseDefault, name)
+	}
+	return "Running " + name
 }
 
 type streamerState int
@@ -1009,6 +995,7 @@ const (
 type streamer struct {
 	ctx           context.Context
 	tg            *telego.Bot
+	msgs          *messages.Loader
 	chatID        int64
 	placeholderID int // status indicator — edited by renderStatus only
 	messageID     int // current text target; == placeholderID ⇒ next text chunk starts a new message
@@ -1028,10 +1015,11 @@ type streamer struct {
 	done chan struct{}
 }
 
-func newStreamer(ctx context.Context, tg *telego.Bot, chatID int64, messageID int, streamInterval time.Duration) *streamer {
+func newStreamer(ctx context.Context, tg *telego.Bot, msgs *messages.Loader, chatID int64, messageID int, streamInterval time.Duration) *streamer {
 	s := &streamer{
 		ctx:            ctx,
 		tg:             tg,
+		msgs:           msgs,
 		streamInterval: streamInterval,
 		chatID:         chatID,
 		placeholderID:  messageID,
@@ -1088,9 +1076,9 @@ func (s *streamer) renderStatus() {
 	elapsed := int(time.Since(start).Seconds())
 	switch state {
 	case stateBusy:
-		s.editStatus(fmt.Sprintf("%s... (%ds)", gerundFor(start), elapsed))
+		s.editStatus(fmt.Sprintf("%s... (%ds)", s.gerundFor(start), elapsed))
 	case stateTool:
-		s.editStatus(fmt.Sprintf("%s... (%ds)", toolPhrase(tool), elapsed))
+		s.editStatus(fmt.Sprintf("%s... (%ds)", s.toolPhrase(tool), elapsed))
 	}
 }
 

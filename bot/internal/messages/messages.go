@@ -32,6 +32,9 @@ type UI struct {
 	ContextWarnFormat      string `json:"context_warn_format"`
 	RecentAssistantHeader  string `json:"recent_assistant_header"`
 	ChatMembersPrefix      string `json:"chat_members_prefix"`
+	BusyGerunds            []string          `json:"busy_gerunds"`
+	ToolPhrases            map[string]string `json:"tool_phrases"`
+	ToolPhraseDefault      string            `json:"tool_phrase_default"`
 }
 
 type Prompts struct {
@@ -156,6 +159,23 @@ func BuiltinDefaults() *Bundle {
 			ContextWarnFormat:     "This chat is getting long (≈%d tokens). Send /reset if memory matters.",
 			RecentAssistantHeader: "[INTERNAL CONTEXT — do not cite or respond]\nYour recent messages — do not repeat:",
 			ChatMembersPrefix:     "Known members of this chat (names in [brackets] map to these people): ",
+			BusyGerunds: []string{
+				"Thinking", "Cogitating", "Pondering", "Ruminating",
+				"Marinating", "Percolating", "Synthesizing", "Calibrating",
+				"Confabulating", "Wrangling thoughts", "Noodling",
+				"Crystallizing", "Mulling it over", "Sharpening pencils",
+				"Consulting the oracle",
+			},
+			ToolPhrases: map[string]string{
+				"search_web":        "Searching the web",
+				"fetch_url":         "Reading the page",
+				"get_weather":       "Checking the weather",
+				"get_crypto_price":  "Checking crypto",
+				"get_exchange_rate": "Checking the exchange rate",
+				"recall":            "Digging through memory",
+				"set_reminder":      "Setting a reminder",
+			},
+			ToolPhraseDefault: "Running %s",
 		},
 		Prompts: Prompts{
 			Spontaneous:     "[SYSTEM] Optional unsolicited reply. Only chime in with a sharp line; otherwise reply SKIP.",
