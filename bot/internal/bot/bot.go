@@ -1009,8 +1009,9 @@ type streamer struct {
 	toolName   string
 	lastFlush  time.Time
 
-	editMu   sync.Mutex
-	lastSent string
+	editMu     sync.Mutex
+	lastSent   string // last text written to the content message
+	lastStatus string // last text written to the placeholder
 
 	done chan struct{}
 }
@@ -1033,8 +1034,14 @@ func newStreamer(ctx context.Context, tg *telego.Bot, msgs *messages.Loader, cha
 	return s
 }
 
+// Status ticks edit the placeholder. Telegram rate-limits per-chat edit
+// volume, and reasoning models can spend 30-60s in stateBusy before any
+// visible text arrives — at 2s ticks that was ~20 edits on a single message
+// per turn, which triggered 22s retry-after lockouts that then killed the
+// final reply's edit/send. The gerund only rotates every 4s, so 6s ticks
+// keep the visual cadence while cutting edit volume ~3×.
 func (s *streamer) tickLoop() {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(6 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -1052,10 +1059,17 @@ func (s *streamer) editStatus(text string) {
 	if text == "" {
 		return
 	}
+	text = textutil.Ellipsize(text, maxMsgLen)
+	s.editMu.Lock()
+	if text == s.lastStatus {
+		s.editMu.Unlock()
+		return
+	}
+	s.editMu.Unlock()
 	_, err := s.tg.EditMessageText(s.ctx, &telego.EditMessageTextParams{
 		ChatID:    tu.ID(s.chatID),
 		MessageID: s.placeholderID,
-		Text:      textutil.Ellipsize(text, maxMsgLen),
+		Text:      text,
 	})
 	if err != nil {
 		errStr := err.Error()
@@ -1063,7 +1077,11 @@ func (s *streamer) editStatus(text string) {
 			!strings.Contains(errStr, "Too Many Requests") {
 			log.Printf("editStatus: msg=%d err=%v", s.placeholderID, err)
 		}
+		return
 	}
+	s.editMu.Lock()
+	s.lastStatus = text
+	s.editMu.Unlock()
 }
 
 func (s *streamer) renderStatus() {
