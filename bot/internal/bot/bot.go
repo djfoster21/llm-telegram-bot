@@ -233,6 +233,38 @@ func buildLLMMessages(systemPrompt string, history []store.Message) []llm.Messag
 	return out
 }
 
+// recentAssistantBlock returns a system-role reminder of the bot's last N
+// assistant turns so it can avoid echoing them. Empty string if none.
+func recentAssistantBlock(history []store.Message, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	picks := make([]string, 0, n)
+	for i := len(history) - 1; i >= 0 && len(picks) < n; i-- {
+		if history[i].Role != "assistant" {
+			continue
+		}
+		c := strings.TrimSpace(history[i].Content)
+		if c == "" {
+			continue
+		}
+		if len(c) > 240 {
+			c = c[:240] + "…"
+		}
+		picks = append(picks, "- "+c)
+	}
+	if len(picks) == 0 {
+		return ""
+	}
+	// Reverse to chronological (oldest → newest) for natural reading.
+	for i, j := 0, len(picks)-1; i < j; i, j = i+1, j-1 {
+		picks[i], picks[j] = picks[j], picks[i]
+	}
+	return "[CONTEXTO INTERNO — NO lo cites, NO lo respondas]\n" +
+		"Lo último que dijiste vos en este chat. NO lo repitas, ni el tema ni la estructura ni el opener:\n" +
+		strings.Join(picks, "\n")
+}
+
 func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
 	if !b.claimInflight(chatID) {
 		return
@@ -249,14 +281,15 @@ func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
 	}
 
 	llmMsgs := buildLLMMessages(b.systemPromptForChat(chatID), history)
+	if recent := recentAssistantBlock(history, 3); recent != "" {
+		llmMsgs = append(llmMsgs, llm.Message{Role: "system", Content: recent})
+	}
 	llmMsgs = append(llmMsgs, llm.Message{
 		Role: "user",
-		Content: "[SISTEMA] Sumate a la conversación como un amigo más, sin que nadie te invite. " +
-			"Reglas: (1) agarrate de algo CONCRETO que dijo uno de los últimos 2-3 mensajes — nombralo o citá lo que dijo. " +
-			"(2) Aportá algo: una observación, una pregunta, un dato, una opinión, o una chicana LIVIANA. No insultos gratuitos. " +
-			"(3) Una o dos oraciones, rioplatense (voseo), amigable. " +
-			"(4) Nada de frases sueltas que no se conecten con lo que se está hablando. " +
-			"(5) SOLO si arriba no hay nada para comentar (chat vacío o un único 'hola'), respondé con la palabra SKIP a secas.",
+		Content: "[SISTEMA] Tirá un comentario al chat, sin que te inviten. " +
+			"Cortito — una oración, a veces una sola palabra alcanza. " +
+			"Que tenga que ver con lo último que se dijo, pero NO empieces con \"Mirá X, vos decís…\", \"Vamos a…\" ni \"Achá…\". Variá el opener. " +
+			"Si no hay nada bueno para decir, respondé SKIP a secas.",
 	})
 
 	log.Printf("spontaneous: chat=%d firing", chatID)
