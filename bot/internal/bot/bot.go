@@ -286,10 +286,11 @@ func (b *Bot) spontaneousReply(ctx context.Context, chatID int64) {
 	}
 	llmMsgs = append(llmMsgs, llm.Message{
 		Role: "user",
-		Content: "[SISTEMA] Tirá un comentario al chat, sin que te inviten. " +
-			"Cortito — una oración, a veces una sola palabra alcanza. " +
-			"Que tenga que ver con lo último que se dijo, pero NO empieces con \"Mirá X, vos decís…\", \"Vamos a…\" ni \"Achá…\". Variá el opener. " +
-			"Si no hay nada bueno para decir, respondé SKIP a secas.",
+		Content: "[SISTEMA] Tenés la oportunidad de meterte sin que te inviten. " +
+			"Solo metete si tenés una línea AFILADA — una chicana que cierre, un dato que aporte, un undercut que pegue, una observación que sume. " +
+			"Si lo único que se te ocurre es algo regular, blando, o ya parecido a algo que dijiste, contestá SKIP a secas. Mejor callarse y esperar el próximo momento. " +
+			"Cortito — una oración, a veces una palabra. NO arranques con \"Mirá X, vos decís…\", \"Vamos a…\", ni \"Achá…\". " +
+			"Si vas, va con punch.",
 	})
 
 	log.Printf("spontaneous: chat=%d firing", chatID)
