@@ -10,3 +10,5 @@ searxng/settings.yml
 .llama-server.pid
 llama-server.log
 .serena/
+chat.txt
+*.log
