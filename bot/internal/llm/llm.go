@@ -175,6 +175,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 	var content strings.Builder
 	calls := map[int]*ToolCall{}
 	var stripper thinkStripper
+	buf := &inlineToolBuffer{inner: h}
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
@@ -199,9 +200,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 			visible := stripper.feed(ch.Delta.Content)
 			if visible != "" {
 				content.WriteString(visible)
-				if h != nil {
-					h.OnText(visible)
-				}
+				buf.feed(visible)
 			}
 		}
 		for _, tc := range ch.Delta.ToolCalls {
@@ -232,9 +231,7 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 	}
 	if tail := stripper.flush(); tail != "" {
 		content.WriteString(tail)
-		if h != nil {
-			h.OnText(tail)
-		}
+		buf.feed(tail)
 	}
 
 	indices := make([]int, 0, len(calls))
@@ -246,7 +243,119 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool, h Strea
 	for _, i := range indices {
 		ordered = append(ordered, *calls[i])
 	}
+
+	// Fallback: some models (small Qwen variants) emit tool calls as raw JSON
+	// in the content stream instead of through the structured tool_calls
+	// protocol. If we got no structured calls but the buffered output parses
+	// as a tool-call shape, route it as a call.
+	if len(ordered) == 0 && !buf.passedThrough() {
+		if tc, ok := buf.parseToolCall(); ok {
+			return "", []ToolCall{tc}, nil
+		}
+		// Not parseable — emit the buffered content as text so the user isn't
+		// left with an empty reply.
+		buf.emitBuffered()
+	}
 	return content.String(), ordered, nil
+}
+
+// inlineToolBuffer wraps a StreamHandler and decides, on the first non-blank
+// content chunk, whether the stream looks like a raw tool-call JSON (in which
+// case it suppresses passthrough so the user never sees the JSON) or regular
+// text (in which case it flushes the buffer and switches to passthrough).
+type inlineToolBuffer struct {
+	inner    StreamHandler
+	buf      strings.Builder
+	decision int // 0=undecided, 1=passthrough, 2=suppress (looks like tool call)
+}
+
+func (b *inlineToolBuffer) feed(delta string) {
+	switch b.decision {
+	case 1:
+		if b.inner != nil {
+			b.inner.OnText(delta)
+		}
+		return
+	case 2:
+		b.buf.WriteString(delta)
+		return
+	}
+	// Undecided. Buffer and re-evaluate.
+	b.buf.WriteString(delta)
+	trimmed := strings.TrimLeft(b.buf.String(), " \t\n\r")
+	if trimmed == "" {
+		return
+	}
+	first := trimmed[0]
+	if first != '{' && first != '<' {
+		b.commitPassthrough()
+		return
+	}
+	// Tool-call shapes start with `{` or `<tool_call>`. Wait until we have
+	// enough characters to disambiguate; otherwise an early `{` would commit
+	// to passthrough before "name" arrives.
+	if first == '<' {
+		if len(trimmed) < len("<tool_call>") {
+			return
+		}
+		if strings.HasPrefix(trimmed, "<tool_call>") {
+			b.decision = 2
+		} else {
+			b.commitPassthrough()
+		}
+		return
+	}
+	// first == '{'. Need enough to see `"name"` (allow inner whitespace).
+	if len(trimmed) < 16 {
+		return
+	}
+	inner := strings.TrimLeft(trimmed[1:], " \t\n\r")
+	if strings.HasPrefix(inner, "\"name\"") {
+		b.decision = 2
+	} else {
+		b.commitPassthrough()
+	}
+}
+
+func (b *inlineToolBuffer) commitPassthrough() {
+	b.decision = 1
+	if b.inner != nil && b.buf.Len() > 0 {
+		b.inner.OnText(b.buf.String())
+	}
+	b.buf.Reset()
+}
+
+func (b *inlineToolBuffer) passedThrough() bool { return b.decision == 1 }
+
+func (b *inlineToolBuffer) emitBuffered() {
+	if b.inner != nil && b.buf.Len() > 0 {
+		b.inner.OnText(b.buf.String())
+	}
+}
+
+func (b *inlineToolBuffer) parseToolCall() (ToolCall, bool) {
+	raw := strings.TrimSpace(b.buf.String())
+	raw = strings.TrimPrefix(raw, "<tool_call>")
+	raw = strings.TrimSuffix(raw, "</tool_call>")
+	raw = strings.TrimSpace(raw)
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal([]byte(raw), &p); err != nil || p.Name == "" {
+		return ToolCall{}, false
+	}
+	if b.inner != nil {
+		b.inner.OnToolStart(p.Name)
+	}
+	return ToolCall{
+		ID:   fmt.Sprintf("inline_%d", time.Now().UnixNano()),
+		Type: "function",
+		Function: FunctionCall{
+			Name:      p.Name,
+			Arguments: string(p.Arguments),
+		},
+	}, true
 }
 
 // thinkStripper removes <think>...</think> reasoning blocks from a streamed
