@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,6 +26,7 @@ const (
 	coingeckoAPI   = "https://api.coingecko.com/api/v3/simple/price"
 	dolarAPIBase   = "https://dolarapi.com/v1/dolares"
 	erAPIBase      = "https://open.er-api.com/v6/latest"
+	giphyAPI       = "https://api.giphy.com/v1/gifs/search"
 	requestTimeout = 10 * time.Second
 )
 
@@ -68,6 +70,7 @@ func main() {
 	mux.HandleFunc("/weather", handleWeather)
 	mux.HandleFunc("/crypto", handleCrypto)
 	mux.HandleFunc("/fx", handleFx)
+	mux.HandleFunc("/meme", handleMeme)
 
 	addr := ":" + getenv("PORT", "8080")
 	log.Printf("data-api listening on %s", addr)
@@ -350,6 +353,67 @@ func handleFx(w http.ResponseWriter, r *http.Request) {
 		Rate: rate,
 		AsOf: er.Date,
 	})
+}
+
+// ---------------- meme (Giphy) ----------------
+
+type memeResp struct {
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
+}
+
+func handleMeme(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		writeError(w, http.StatusBadRequest, "missing required parameter: q")
+		return
+	}
+	key := os.Getenv("GIPHY_API_KEY")
+	if key == "" {
+		writeError(w, http.StatusServiceUnavailable, "GIPHY_API_KEY not configured")
+		return
+	}
+
+	v := url.Values{}
+	v.Set("api_key", key)
+	v.Set("q", q)
+	v.Set("limit", "25")
+	v.Set("rating", "pg-13")
+	v.Set("lang", "es")
+
+	var raw struct {
+		Data []struct {
+			Title  string `json:"title"`
+			Images struct {
+				Original          struct{ MP4, URL string } `json:"original"`
+				FixedHeight       struct{ MP4, URL string } `json:"fixed_height"`
+				DownsizedMedium   struct{ URL string }      `json:"downsized_medium"`
+			} `json:"images"`
+		} `json:"data"`
+	}
+	if err := fetchJSON(r.Context(), giphyAPI+"?"+v.Encode(), &raw); err != nil {
+		writeError(w, http.StatusBadGateway, "giphy failed: "+err.Error())
+		return
+	}
+	if len(raw.Data) == 0 {
+		writeError(w, http.StatusNotFound, "no memes found for "+q)
+		return
+	}
+
+	pick := raw.Data[rand.Intn(len(raw.Data))]
+	// Prefer MP4 — Telegram converts GIF→MP4 anyway, this saves the round trip.
+	gif := pick.Images.Original.MP4
+	if gif == "" {
+		gif = pick.Images.FixedHeight.MP4
+	}
+	if gif == "" {
+		gif = pick.Images.Original.URL
+	}
+	if gif == "" {
+		writeError(w, http.StatusBadGateway, "no usable media url in giphy result")
+		return
+	}
+	writeJSON(w, http.StatusOK, memeResp{URL: gif, Title: pick.Title})
 }
 
 // ---------------- helpers ----------------

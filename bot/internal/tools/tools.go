@@ -13,6 +13,8 @@ import (
 	"time"
 
 	readability "github.com/go-shiori/go-readability"
+	"github.com/mymmrac/telego"
+	tu "github.com/mymmrac/telego/telegoutil"
 
 	"llm-telegram-bot/internal/llm"
 	"llm-telegram-bot/internal/messages"
@@ -59,6 +61,14 @@ type Registry struct {
 	msgs       *messages.Loader
 	http       *http.Client // for internal services (searxng, data-api)
 	fetch      *http.Client // for fetch_url: SSRF-guarded against non-public IPs
+	tg         *telego.Bot  // for tools with chat-side effects (send_meme); set via SetTelegram
+}
+
+// SetTelegram wires the Telegram client used by side-effect tools. Called
+// from main after bot.New constructs the Bot, since the Bot owns the telego
+// client and the Registry is created before it.
+func (r *Registry) SetTelegram(tg *telego.Bot) {
+	r.tg = tg
 }
 
 func New(searxngURL, dataAPIURL string, db *store.Store, msgs *messages.Loader) *Registry {
@@ -265,6 +275,27 @@ func (r *Registry) Definitions() []llm.Tool {
 		{
 			Type: "function",
 			Function: llm.ToolDefinition{
+				Name: "send_meme",
+				Description: "Send an animated GIF / meme to the chat as a reaction. " +
+					"Use to convey a feeling or mood with a short keyword: \"facepalm\", \"crying\", " +
+					"\"happy dance\", \"shrug\", \"thumbs up\", \"mind blown\". The GIF is delivered " +
+					"directly to the chat — you do NOT need to add a long text reply afterward; " +
+					"one or two extra words at most, or nothing.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query": map[string]any{
+							"type":        "string",
+							"description": "1-4 English keywords describing the mood or reaction. Examples: \"sad\", \"facepalm\", \"happy dance\", \"shrug\".",
+						},
+					},
+					"required": []string{"query"},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: llm.ToolDefinition{
 				Name: "get_exchange_rate",
 				Description: "Get currency conversion rate. PREFER this over search_web for any exchange-rate question. " +
 					"Special case: from=USD to=ARS returns ALL the Argentinian variants (oficial, blue, mep, ccl, tarjeta, mayorista, cripto) — the user usually wants 'blue'. " +
@@ -339,6 +370,14 @@ func (r *Registry) Execute(ctx context.Context, call llm.ToolCall) string {
 			return `Error: invalid arguments. Expected {"query": "..."}.`
 		}
 		return r.recall(ctx, a.Query)
+	case "send_meme":
+		var a struct {
+			Query string `json:"query"`
+		}
+		if !parseArgs(raw, &a, &a.Query) {
+			return `Error: invalid arguments. Expected {"query": "..."}.`
+		}
+		return r.sendMeme(ctx, a.Query)
 	case "set_reminder":
 		var a struct {
 			InSeconds int    `json:"in_seconds"`
@@ -352,6 +391,36 @@ func (r *Registry) Execute(ctx context.Context, call llm.ToolCall) string {
 	default:
 		return "Error: unknown tool " + call.Function.Name
 	}
+}
+
+func (r *Registry) sendMeme(ctx context.Context, query string) string {
+	if r.tg == nil {
+		return "Error: telegram client not configured for send_meme."
+	}
+	chatID, ok := chatIDFromContext(ctx)
+	if !ok {
+		return "Error: chat context unavailable."
+	}
+	body := r.getFromDataAPI(ctx, "/meme", "q", query)
+	var meme struct {
+		URL   string `json:"url"`
+		Title string `json:"title"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &meme); err != nil {
+		return "Error: meme lookup failed."
+	}
+	if meme.Error != "" || meme.URL == "" {
+		return "No meme found."
+	}
+	_, err := r.tg.SendAnimation(ctx, &telego.SendAnimationParams{
+		ChatID:    tu.ID(chatID),
+		Animation: telego.InputFile{URL: meme.URL},
+	})
+	if err != nil {
+		return "Error: failed to send meme."
+	}
+	return "Meme sent. Keep your reply to one or two words, or nothing."
 }
 
 func (r *Registry) recall(ctx context.Context, query string) string {

@@ -114,6 +114,8 @@ func New(cfg *config.Config, db *store.Store, llmClient *llm.Client, registry *t
 	}, nil
 }
 
+func (b *Bot) TG() *telego.Bot { return b.tg }
+
 func (b *Bot) claimInflight(chatID int64) bool {
 	b.inflightMu.Lock()
 	defer b.inflightMu.Unlock()

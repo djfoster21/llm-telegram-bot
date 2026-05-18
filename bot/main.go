@@ -57,6 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("bot: %v", err)
 	}
+	registry.SetTelegram(b.TG())
 
 	if err := b.Run(ctx); err != nil {
 		log.Fatalf("run: %v", err)
